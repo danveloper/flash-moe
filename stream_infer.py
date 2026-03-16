@@ -1439,7 +1439,7 @@ def split_layer_entries(entries):
 def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_index, model_path,
                                preload_topk=0, cache_gb=20.0, profile=False,
                                use_pread=False, pread_index=None, pread_fds=None,
-                               use_cext=False):
+                               use_cext=False, batch_experts=False):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1564,6 +1564,10 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     }
     del _cfg, _qcfg
 
+    if batch_experts:
+        print(f"  [batch-experts] Fused eval mode: 2 syncs/layer (was 4). "
+              f"Eliminates {num_layers * 2} Metal syncs/token.")
+
     # === I/O instrumentation counters (per-token, reset each token) ===
     io_stats_history = []  # list of per-token dicts
 
@@ -1630,18 +1634,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                 r = layer.self_attn(x_normed, mask, c)
             h_mid = h + r
 
-            if profile:
-                # Separate the mx.eval sync time from the compute setup
-                t_attn_eval = time.perf_counter()
-                mx.eval(h_mid)
-                t_attn_eval_done = time.perf_counter()
-            else:
-                mx.eval(h_mid)
-
             # Run router to discover which experts are needed
-            if profile:
-                t_route = time.perf_counter()
-
             h_post = layer.post_attention_layernorm(h_mid)
             gates = layer.mlp.gate(h_post)
             gates = mx.softmax(gates, axis=-1, precise=True)
@@ -1650,17 +1643,38 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             scores = mx.take_along_axis(gates, inds, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
-            if profile:
-                t_route_eval = time.perf_counter()
-                mx.eval(inds)
-                t_route_eval_done = time.perf_counter()
-                layer_attn_eval_ms = (t_attn_eval_done - t_attn_eval) * 1000
-                layer_route_eval_ms = (t_route_eval_done - t_route_eval) * 1000
-                # Routing = total attn+route time MINUS the eval sync portions
-                layer_routing_ms = (t_route_eval_done - t_attn) * 1000 - layer_attn_eval_ms - layer_route_eval_ms
+            if batch_experts:
+                # Fused eval: evaluate attention + routing in a single Metal sync.
+                # In the default path, h_mid and inds are eval'd separately (2 syncs).
+                # Fusing them halves the sync overhead for this phase.
+                if profile:
+                    t_attn_eval = time.perf_counter()
+                    mx.eval(h_mid, inds)
+                    t_attn_eval_done = time.perf_counter()
+                    # Attribute all eval time to the combined sync
+                    layer_attn_eval_ms = (t_attn_eval_done - t_attn_eval) * 1000
+                    layer_route_eval_ms = 0.0
+                    layer_routing_ms = (t_attn_eval - t_attn) * 1000
+                else:
+                    mx.eval(h_mid, inds)
+                    attn_router_time = time.time() - t_attn
             else:
-                mx.eval(inds)
-                attn_router_time = time.time() - t_attn
+                if profile:
+                    # Separate the mx.eval sync time from the compute setup
+                    t_attn_eval = time.perf_counter()
+                    mx.eval(h_mid)
+                    t_attn_eval_done = time.perf_counter()
+                    t_route_eval = time.perf_counter()
+                    mx.eval(inds)
+                    t_route_eval_done = time.perf_counter()
+                    layer_attn_eval_ms = (t_attn_eval_done - t_attn_eval) * 1000
+                    layer_route_eval_ms = (t_route_eval_done - t_route_eval) * 1000
+                    # Routing = total attn+route time MINUS the eval sync portions
+                    layer_routing_ms = (t_route_eval_done - t_attn) * 1000 - layer_attn_eval_ms - layer_route_eval_ms
+                else:
+                    mx.eval(h_mid)
+                    mx.eval(inds)
+                    attn_router_time = time.time() - t_attn
 
             # ====== Phase 3: Selective expert loading + compute ======
             if profile:
@@ -1807,46 +1821,86 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     if slices:
                         expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
 
-            # Force-eval the assembled expert weight tensors
-            if profile:
-                t_expert_eval = time.perf_counter()
-                mx.eval(*expert_tensors.values())
-                t_expert_eval_done = time.perf_counter()
-                layer_expert_eval_ms = (t_expert_eval_done - t_expert_eval) * 1000
+            if batch_experts:
+                # Skip mx.eval(*expert_tensors.values()) — the stacked weight tensors
+                # are already concrete (from ExpertCache). Letting gather_qmm consume
+                # them directly avoids one Metal sync per layer. The mx.eval(h) below
+                # evaluates the full MoE computation graph (stack + gather_qmm + activation)
+                # in a single fused Metal submission.
+                if profile:
+                    layer_expert_eval_ms = 0.0
+                    t_moe = time.perf_counter()
+                else:
+                    t_moe = time.time()
+
+                y = compute_moe_direct(
+                    h_post, remapped_inds, expert_tensors,
+                    group_size=qparams["group_size"],
+                    bits=qparams["bits"],
+                    mode=qparams["mode"],
+                )
+                y = (y * scores[..., None]).sum(axis=-2)
+
+                # Run shared expert (already loaded in phase 1)
+                shared_y = layer.mlp.shared_expert(h_post)
+                shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+                y = y + shared_y
+
+                h = h_mid + y
+
+                # Single eval: evaluates stacked weights + gather_qmm + shared expert + residual
+                if profile:
+                    t_compute_eval = time.perf_counter()
+                    mx.eval(h)
+                    t_compute_eval_done = time.perf_counter()
+                    layer_compute_eval_ms = (t_compute_eval_done - t_compute_eval) * 1000
+                    layer_compute_ms = (t_compute_eval - t_moe) * 1000
+                    token_moe_compute_time += (t_compute_eval_done - t_moe)
+                else:
+                    mx.eval(h)
+                    token_moe_compute_time += time.time() - t_moe
             else:
-                mx.eval(*expert_tensors.values())
+                # Default path: eval expert weights separately, then compute
+                # Force-eval the assembled expert weight tensors
+                if profile:
+                    t_expert_eval = time.perf_counter()
+                    mx.eval(*expert_tensors.values())
+                    t_expert_eval_done = time.perf_counter()
+                    layer_expert_eval_ms = (t_expert_eval_done - t_expert_eval) * 1000
+                else:
+                    mx.eval(*expert_tensors.values())
 
-            # Run expert MoE computation directly via mx.gather_qmm (no model weight mutation)
-            if profile:
-                t_moe = time.perf_counter()
-            else:
-                t_moe = time.time()
+                # Run expert MoE computation directly via mx.gather_qmm (no model weight mutation)
+                if profile:
+                    t_moe = time.perf_counter()
+                else:
+                    t_moe = time.time()
 
-            y = compute_moe_direct(
-                h_post, remapped_inds, expert_tensors,
-                group_size=qparams["group_size"],
-                bits=qparams["bits"],
-                mode=qparams["mode"],
-            )
-            y = (y * scores[..., None]).sum(axis=-2)
+                y = compute_moe_direct(
+                    h_post, remapped_inds, expert_tensors,
+                    group_size=qparams["group_size"],
+                    bits=qparams["bits"],
+                    mode=qparams["mode"],
+                )
+                y = (y * scores[..., None]).sum(axis=-2)
 
-            # Run shared expert (already loaded in phase 1)
-            shared_y = layer.mlp.shared_expert(h_post)
-            shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
-            y = y + shared_y
+                # Run shared expert (already loaded in phase 1)
+                shared_y = layer.mlp.shared_expert(h_post)
+                shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+                y = y + shared_y
 
-            h = h_mid + y
+                h = h_mid + y
 
-            if profile:
-                t_compute_eval = time.perf_counter()
-                mx.eval(h)
-                t_compute_eval_done = time.perf_counter()
-                layer_compute_eval_ms = (t_compute_eval_done - t_compute_eval) * 1000
-                layer_compute_ms = (t_compute_eval - t_moe) * 1000  # pure compute setup (lazy graph build)
-                token_moe_compute_time += (t_compute_eval_done - t_moe)
-            else:
-                mx.eval(h)
-                token_moe_compute_time += time.time() - t_moe
+                if profile:
+                    t_compute_eval = time.perf_counter()
+                    mx.eval(h)
+                    t_compute_eval_done = time.perf_counter()
+                    layer_compute_eval_ms = (t_compute_eval_done - t_compute_eval) * 1000
+                    layer_compute_ms = (t_compute_eval - t_moe) * 1000  # pure compute setup (lazy graph build)
+                    token_moe_compute_time += (t_compute_eval_done - t_moe)
+                else:
+                    mx.eval(h)
+                    token_moe_compute_time += time.time() - t_moe
 
             # Clear protection now that experts are assembled and computed
             expert_cache.unprotect()
@@ -3386,6 +3440,11 @@ def main():
                         help="Use fast_expert_io C extension for expert loading. "
                              "Requires expert_index.json and compiled fast_expert_io.so. "
                              "Uses preadv + coalesced I/O with dedicated thread pool.")
+    parser.add_argument("--batch-experts", action="store_true", default=False,
+                        help="Reduce Metal kernel launch overhead by fusing mx.eval() syncs. "
+                             "Merges attention+routing into one sync and skips the separate "
+                             "expert weight eval, cutting per-layer syncs from 4 to 2. "
+                             "Only affects offload_selective mode. Output is identical.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -3563,7 +3622,8 @@ def main():
                                             use_pread=args.use_pread,
                                             pread_index=pread_index,
                                             pread_fds=pread_fds,
-                                            use_cext=args.use_cext)
+                                            use_cext=args.use_cext,
+                                            batch_experts=args.batch_experts)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
