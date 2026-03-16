@@ -1512,7 +1512,10 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                                use_cext=False, batch_experts=False,
                                top_k_override=0, no_expert_cache=False,
                                pin_experts=0, pin_topk=51,
-                               async_pipeline=False):
+                               async_pipeline=False,
+                               skip_layers=0,
+                               batch_layers=0,
+                               numpy_cache_gb=0.0):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1618,7 +1621,26 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     if no_expert_cache:
         print(f"  [no-expert-cache] Skipping ExpertCache — OS page cache handles all expert reads.")
         print(f"  [no-expert-cache] All {active_experts} active experts read from safetensors per layer per token.")
-    else:
+
+    # CPU-side numpy cache: stores raw pread bytes in Python heap (not Metal heap).
+    # On hit: memcpy bytes -> mx.array (~0.11ms). On miss: pread from packed file (~0.7ms).
+    numpy_cache = None
+    numpy_cache_max_entries = 0
+    numpy_cache_hits = 0
+    numpy_cache_misses = 0
+    if numpy_cache_gb > 0 and no_expert_cache and packed_layout is not None:
+        expert_size = packed_layout["expert_size"]  # ~7.08MB per expert
+        numpy_cache_max_entries = int(numpy_cache_gb * 1024**3 / expert_size)
+        numpy_cache = OrderedDict()
+        print(f"  [numpy-cache] CPU-side LRU: {numpy_cache_gb:.1f}GB = {numpy_cache_max_entries} entries "
+              f"({expert_size/1e6:.2f}MB/entry). Stores raw bytes in Python heap, not Metal.")
+    elif numpy_cache_gb > 0:
+        if not no_expert_cache:
+            print(f"  [numpy-cache] DISABLED — requires --no-expert-cache")
+        elif packed_layout is None:
+            print(f"  [numpy-cache] DISABLED — requires packed expert files")
+
+    if not no_expert_cache:
         cache_entries = num_layers * active_experts * 8
 
         # Estimate per-entry bytes to enforce memory cap
@@ -1670,6 +1692,24 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     if batch_experts:
         print(f"  [batch-experts] Fused eval mode: 2 syncs/layer (was 4). "
               f"Eliminates {num_layers * 2} Metal syncs/token.")
+
+    # Validate batch_layers prerequisites
+    use_batch_layers = (batch_layers > 0 and no_expert_cache and batch_experts
+                        and _packed_comps is not None and packed_fds)
+    if batch_layers > 0 and not use_batch_layers:
+        missing = []
+        if not no_expert_cache:
+            missing.append("--no-expert-cache")
+        if not batch_experts:
+            missing.append("--batch-experts")
+        if _packed_comps is None or not packed_fds:
+            missing.append("packed expert files")
+        print(f"  [batch-layers] DISABLED — requires: {', '.join(missing)}")
+    elif use_batch_layers:
+        n_batches = (num_layers + batch_layers - 1) // batch_layers
+        saved_evals = num_layers - n_batches
+        print(f"  [batch-layers] N={batch_layers}: {n_batches} batched evals instead of {num_layers}. "
+              f"Saves ~{saved_evals} Metal syncs/token. Routing approximate for layers 2-{batch_layers} in each batch.")
 
     # Validate async_pipeline prerequisites
     use_async_pipeline = (async_pipeline and no_expert_cache and batch_experts
@@ -1724,6 +1764,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
               f"topk={pin_topk}/layer, num_experts={num_experts_total}")
 
     _io_pool = ThreadPoolExecutor(max_workers=8)  # reuse across tokens+layers
+    _routing_stream = mx.new_stream(mx.default_device())  # separate Metal stream for routing
 
     for token_idx in range(max_tokens):
         t_token_start = time.perf_counter() if profile else time.time()
@@ -1755,13 +1796,298 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         # GPU routing computation with CPU I/O processing.
         _ap_prev_futures = None       # dict {eidx: Future} from previous layer's pread dispatch
         _ap_prev_unpinned = None      # list of unpinned expert indices from previous layer
+        _ap_prev_np_cached = {}       # dict {eidx: raw_bytes} numpy-cache hits from previous layer
         _ap_prev_pinned_attrs = None  # dict {eidx: attrs} for pinned experts from previous layer
         _ap_prev_unique_list = None   # full unique_list from previous layer
         _ap_prev_layer_data = None    # (prev_i, prev_layer, remapped_inds, scores, h_mid, h_post)
         _ap_prev_io_bytes = 0         # bytes read by previous layer's I/O
 
+        # --- Batch-layers state (reset per token) ---
+        _bl_done = set()  # layers already processed by batch-layers path
+
         # --- Per-layer: selective load, compute (clearing deferred to end of token) ---
         for i in range(num_layers):
+            # Layer skipping: skip every Nth layer in the middle to reduce compute+I/O
+            if skip_layers > 0 and 10 <= i < num_layers - 10 and i % skip_layers != 0:
+                continue
+
+            # Skip layers already processed by batch-layers path
+            if i in _bl_done:
+                continue
+
+            # ====== BATCH-LAYERS PATH ======
+            # When batch_layers > 0, process N layers at once:
+            #   Phase 1: Build attention+routing for N layers lazily (approximate h)
+            #   Phase 2: Single mx.eval for all N routing decisions
+            #   Phase 3: Batch-read experts for all N layers
+            #   Phase 4: Compute MoE for all N layers with correct h chain
+            #
+            # Routing for layers 2-N in each batch uses h_mid (no expert contribution
+            # from prior layers in the batch), making routing approximate. Quality impact
+            # is ~7.5% wrong expert selections on layers 2-N of each batch.
+            if use_batch_layers and i in packed_layers:
+                batch_end = min(i + batch_layers, num_layers)
+                # Collect layers in this batch (respecting skip_layers)
+                batch_layer_indices = []
+                for bi in range(i, batch_end):
+                    if skip_layers > 0 and 10 <= bi < num_layers - 10 and bi % skip_layers != 0:
+                        continue
+                    if bi not in packed_layers:
+                        break  # stop batch at first non-packed layer
+                    batch_layer_indices.append(bi)
+
+                if len(batch_layer_indices) >= 2:
+                    # Worth batching (2+ layers)
+                    t_batch_start = time.perf_counter() if profile else time.time()
+
+                    # Phase 1: Build attention + routing for all batch layers lazily.
+                    # h propagates as h_mid (attention output, no expert contribution).
+                    # This makes routing approximate for layers after the first.
+                    h_pre_batch = h  # save for Phase 4
+                    all_batch_inds = []
+                    all_batch_scores = []
+                    all_batch_h_mids = []
+                    all_batch_h_posts = []
+                    all_batch_k = []
+
+                    for bi in batch_layer_indices:
+                        bl = layers[bi]
+                        bc = cache[bi]
+                        x_normed = bl.input_layernorm(h)
+                        mask = ssm_mask if bl.is_linear else fa_mask
+                        if bl.is_linear:
+                            r = bl.linear_attn(x_normed, mask, bc)
+                        else:
+                            r = bl.self_attn(x_normed, mask, bc)
+                        h_mid_b = h + r
+                        h_post_b = bl.post_attention_layernorm(h_mid_b)
+                        gates_b = bl.mlp.gate(h_post_b)
+                        gates_b = mx.softmax(gates_b, axis=-1, precise=True)
+                        k_b = bl.mlp.top_k if top_k_override <= 0 else min(bl.mlp.top_k, top_k_override)
+                        inds_b = mx.argpartition(gates_b, kth=-k_b, axis=-1)[..., -k_b:]
+                        scores_b = mx.take_along_axis(gates_b, inds_b, axis=-1)
+                        scores_b = scores_b / scores_b.sum(axis=-1, keepdims=True)
+
+                        all_batch_inds.append(inds_b)
+                        all_batch_scores.append(scores_b)
+                        all_batch_h_mids.append(h_mid_b)
+                        all_batch_h_posts.append(h_post_b)
+                        all_batch_k.append(k_b)
+
+                        # Propagate approximate h (no expert contribution)
+                        h = h_mid_b
+
+                    # Phase 2: Single eval for all N routing decisions
+                    mx.eval(*all_batch_inds)
+
+                    t_batch_routing_done = time.perf_counter() if profile else time.time()
+
+                    # Phase 3: Batch-read experts for all N layers
+                    all_batch_expert_tensors = []
+                    all_batch_remapped_inds = []
+                    all_batch_unique_lists = []
+
+                    for idx, bi in enumerate(batch_layer_indices):
+                        bl = layers[bi]
+                        inds_b = all_batch_inds[idx]
+
+                        # Extract routing indices
+                        inds_np = np.array(inds_b.tolist())
+                        unique_experts = np.unique(inds_np)
+                        num_unique = len(unique_experts)
+                        unique_list = unique_experts.tolist()
+
+                        # Build remap table
+                        remap = np.zeros(bl.mlp.num_experts, dtype=np.int32)
+                        remap[unique_experts] = np.arange(num_unique)
+                        remapped_inds_b = mx.array(remap[inds_np])
+
+                        # Track warmup routing
+                        if pin_phase == "warmup":
+                            for eidx in unique_list:
+                                pin_counts[bi, eidx] += 1
+
+                        # Split pinned vs unpinned
+                        layer_pinned = pinned_experts.get(bi, {})
+                        if pin_phase == "active" and layer_pinned:
+                            pinned_list = [idx_e for idx_e in unique_list if idx_e in layer_pinned]
+                            unpinned_list = [idx_e for idx_e in unique_list if idx_e not in layer_pinned]
+                            pin_total_hits += len(pinned_list)
+                            pin_total_lookups += num_unique
+                        else:
+                            pinned_list = []
+                            unpinned_list = unique_list
+
+                        # Read experts (packed path)
+                        all_expert_attrs = {}
+                        for idx_e in pinned_list:
+                            all_expert_attrs[idx_e] = layer_pinned[idx_e]
+
+                        if unpinned_list:
+                            packed_fd = packed_fds[bi]
+                            es = packed_layout["expert_size"]
+
+                            # Split unpinned into numpy-cache hits vs disk reads
+                            if numpy_cache is not None:
+                                np_cached_list = []
+                                np_uncached_list = []
+                                for eidx in unpinned_list:
+                                    nc_key = (bi, eidx)
+                                    if nc_key in numpy_cache:
+                                        numpy_cache.move_to_end(nc_key)
+                                        np_cached_list.append((eidx, numpy_cache[nc_key]))
+                                        numpy_cache_hits += 1
+                                    else:
+                                        np_uncached_list.append(eidx)
+                                        numpy_cache_misses += 1
+                            else:
+                                np_cached_list = []
+                                np_uncached_list = unpinned_list
+
+                            # Numpy-cache hits: convert raw bytes -> mx.arrays
+                            for eidx, raw in np_cached_list:
+                                mv = memoryview(raw)
+                                attrs = {}
+                                for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                                    arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                                    if is_bf16:
+                                        arr = arr.view(mx.bfloat16)
+                                    attrs[(proj, attr)] = arr
+                                all_expert_attrs[eidx] = attrs
+
+                            # Numpy-cache misses: pread from packed file
+                            if np_uncached_list:
+                                read_futures = {eidx: _io_pool.submit(os.pread, packed_fd, es, eidx * es)
+                                                for eidx in np_uncached_list}
+                                for eidx in np_uncached_list:
+                                    raw = read_futures[eidx].result()
+                                    if numpy_cache is not None:
+                                        nc_key = (bi, eidx)
+                                        numpy_cache[nc_key] = raw
+                                        while len(numpy_cache) > numpy_cache_max_entries:
+                                            numpy_cache.popitem(last=False)
+                                    mv = memoryview(raw)
+                                    attrs = {}
+                                    for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                                        arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                                        if is_bf16:
+                                            arr = arr.view(mx.bfloat16)
+                                        attrs[(proj, attr)] = arr
+                                    all_expert_attrs[eidx] = attrs
+                                    token_io_bytes += es
+                                    token_io_seeks += 1
+
+                        if pin_phase == "active":
+                            generate_offload_selective._last_io_misses = getattr(
+                                generate_offload_selective, '_last_io_misses', 0) + len(unpinned_list)
+
+                        # Assemble expert tensors
+                        expert_tensors_b = {}
+                        for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                            for attr_name in ["weight", "scales", "biases"]:
+                                slices = []
+                                for idx_e in unique_list:
+                                    arr = all_expert_attrs[idx_e].get((proj_name, attr_name))
+                                    if arr is not None:
+                                        slices.append(arr)
+                                    else:
+                                        raise RuntimeError(
+                                            f"Batch-layers read miss: layer={bi} expert={idx_e} "
+                                            f"{proj_name}.{attr_name} not found"
+                                        )
+                                if slices:
+                                    expert_tensors_b[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+                        del all_expert_attrs
+
+                        all_batch_expert_tensors.append(expert_tensors_b)
+                        all_batch_remapped_inds.append(remapped_inds_b)
+                        all_batch_unique_lists.append(unique_list)
+
+                    t_batch_io_done = time.perf_counter() if profile else time.time()
+
+                    # Phase 4: Compute MoE for all N layers using pre-computed routing.
+                    # We use the h_mid/h_post from Phase 1 directly. For the first layer
+                    # in the batch these are exact; for subsequent layers they're approximate
+                    # (based on h without expert contributions from prior batch layers).
+                    # This is the core tradeoff: we accept approximate expert inputs to avoid
+                    # re-running attention (which would double-write the KV cache). The I/O
+                    # savings from batched routing far outweigh the quality cost.
+                    for idx, bi in enumerate(batch_layer_indices):
+                        bl = layers[bi]
+                        h_mid_b = all_batch_h_mids[idx]
+                        h_post_b = all_batch_h_posts[idx]
+
+                        # Compute MoE with pre-loaded expert tensors
+                        y = compute_moe_direct(
+                            h_post_b, all_batch_remapped_inds[idx], all_batch_expert_tensors[idx],
+                            group_size=qparams["group_size"],
+                            bits=qparams["bits"],
+                            mode=qparams["mode"],
+                        )
+                        y = (y * all_batch_scores[idx][..., None]).sum(axis=-2)
+
+                        # Shared expert
+                        shared_y = bl.mlp.shared_expert(h_post_b)
+                        shared_y = mx.sigmoid(bl.mlp.shared_expert_gate(h_post_b)) * shared_y
+                        y = y + shared_y
+
+                        h = h_mid_b + y
+
+                        # Release this layer's expert tensors (set to None, don't del from list)
+                        all_batch_expert_tensors[idx] = None
+
+                    # Eval final h after all batch layers
+                    mx.eval(h)
+
+                    t_batch_compute_done = time.perf_counter() if profile else time.time()
+
+                    # Record timing for all layers in the batch
+                    n_bl = len(batch_layer_indices)
+                    batch_routing_ms = (t_batch_routing_done - t_batch_start) * 1000
+                    batch_io_ms = (t_batch_io_done - t_batch_routing_done) * 1000
+                    batch_compute_ms = (t_batch_compute_done - t_batch_io_done) * 1000
+                    batch_total_ms = (t_batch_compute_done - t_batch_start) * 1000
+                    for idx, bi in enumerate(batch_layer_indices):
+                        # Distribute timing equally across layers in the batch (for profiling)
+                        per_layer_ms = batch_total_ms / n_bl if n_bl > 0 else 0.0
+                        layer_timings.append({
+                            "layer": bi,
+                            "is_linear": layers[bi].is_linear,
+                            "attn_router_ms": batch_routing_ms / n_bl,
+                            "expert_ms": (batch_io_ms + batch_compute_ms) / n_bl,
+                            "clear_ms": 0.0,
+                            "load_ms": batch_io_ms / n_bl,
+                            "compute_ms": batch_compute_ms / n_bl,
+                        })
+
+                        if profile and token_idx > 0:
+                            pld = prof_per_layer[bi]
+                            pld["routing_ms"] += batch_routing_ms / n_bl
+                            pld["io_ms"] += batch_io_ms / n_bl
+                            pld["compute_ms"] += batch_compute_ms / n_bl
+                            pld["eval_sync_ms"] += batch_compute_ms / n_bl
+                            pld["hits"] += 0
+                            pld["misses"] += len(all_batch_unique_lists[idx])
+
+                    if profile and token_idx > 0:
+                        prof_totals["routing_ms"] += batch_routing_ms
+                        prof_totals["io_ms"] += batch_io_ms
+                        prof_totals["compute_ms"] += batch_compute_ms
+                        prof_totals["eval_sync_ms"] += batch_compute_ms
+
+                    token_moe_compute_time += batch_compute_ms / 1000.0
+
+                    # Mark all batch layers as done
+                    _bl_done.update(batch_layer_indices)
+
+                    # Clean up batch state
+                    del all_batch_inds, all_batch_scores, all_batch_h_mids, all_batch_h_posts
+                    del all_batch_remapped_inds, all_batch_unique_lists
+                    del all_batch_expert_tensors
+
+                    continue  # skip to next layer after the batch
+                # else: single layer in batch, fall through to normal path
+
             if profile:
                 t_layer_start = time.perf_counter()
 
@@ -1826,8 +2152,27 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     # Convert previous layer's raw pread data -> mx.arrays
                     prev_all_expert_attrs = dict(_ap_prev_pinned_attrs) if _ap_prev_pinned_attrs else {}
                     es = packed_layout["expert_size"]
+
+                    # Process numpy-cache hits first (raw bytes, no pread needed)
+                    if _ap_prev_np_cached:
+                        for eidx, raw in _ap_prev_np_cached.items():
+                            mv = memoryview(raw)
+                            attrs = {}
+                            for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                                arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                                if is_bf16:
+                                    arr = arr.view(mx.bfloat16)
+                                attrs[(proj, attr)] = arr
+                            prev_all_expert_attrs[eidx] = attrs
+
+                    # Process pread futures (disk reads) and store in numpy cache
                     for eidx in _ap_prev_unpinned:
                         raw = _ap_prev_futures[eidx].result()
+                        if numpy_cache is not None:
+                            nc_key = (prev_i, eidx)
+                            numpy_cache[nc_key] = raw
+                            while len(numpy_cache) > numpy_cache_max_entries:
+                                numpy_cache.popitem(last=False)
                         mv = memoryview(raw)
                         attrs = {}
                         for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
@@ -1956,8 +2301,25 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                 # immediately; they'll complete during the next layer's attention+routing)
                 packed_fd = packed_fds[i]
                 es = packed_layout["expert_size"]
+
+                # Split unpinned into numpy-cache hits vs disk reads
+                _ap_np_cached = {}
+                if numpy_cache is not None:
+                    ap_uncached_list = []
+                    for eidx in unpinned_list:
+                        nc_key = (i, eidx)
+                        if nc_key in numpy_cache:
+                            numpy_cache.move_to_end(nc_key)
+                            _ap_np_cached[eidx] = numpy_cache[nc_key]
+                            numpy_cache_hits += 1
+                        else:
+                            ap_uncached_list.append(eidx)
+                            numpy_cache_misses += 1
+                else:
+                    ap_uncached_list = unpinned_list
+
                 current_futures = {eidx: _io_pool.submit(os.pread, packed_fd, es, eidx * es)
-                                   for eidx in unpinned_list}
+                                   for eidx in ap_uncached_list}
 
                 if profile:
                     t_io_done = time.perf_counter()
@@ -1965,17 +2327,36 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
                 # Save state for next iteration
                 _ap_prev_futures = current_futures
-                _ap_prev_unpinned = unpinned_list
+                _ap_prev_unpinned = ap_uncached_list  # only disk-read experts
+                _ap_prev_np_cached = _ap_np_cached    # numpy-cache hits (raw bytes)
                 _ap_prev_pinned_attrs = pinned_attrs
                 _ap_prev_unique_list = unique_list
                 _ap_prev_layer_data = (i, layer, remapped_inds, scores, h_mid, h_post)
-                _ap_prev_io_bytes = len(unpinned_list) * es
+                _ap_prev_io_bytes = len(ap_uncached_list) * es
 
                 # If last layer: process THIS layer's I/O immediately (no next iteration)
                 if i == num_layers - 1:
                     all_expert_attrs = dict(pinned_attrs)
-                    for eidx in unpinned_list:
+
+                    # Process numpy-cache hits (no pread needed)
+                    for eidx, raw in _ap_np_cached.items():
+                        mv = memoryview(raw)
+                        attrs = {}
+                        for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                            arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                            if is_bf16:
+                                arr = arr.view(mx.bfloat16)
+                            attrs[(proj, attr)] = arr
+                        all_expert_attrs[eidx] = attrs
+
+                    # Process pread futures (disk reads) and store in numpy cache
+                    for eidx in ap_uncached_list:
                         raw = current_futures[eidx].result()
+                        if numpy_cache is not None:
+                            nc_key = (i, eidx)
+                            numpy_cache[nc_key] = raw
+                            while len(numpy_cache) > numpy_cache_max_entries:
+                                numpy_cache.popitem(last=False)
                         mv = memoryview(raw)
                         attrs = {}
                         for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
@@ -2143,10 +2524,26 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                         # during pread syscall).
                         packed_fd = packed_fds[i]
                         es = packed_layout["expert_size"]
-                        read_futures = {eidx: _io_pool.submit(os.pread, packed_fd, es, eidx * es)
-                                        for eidx in unpinned_list}
-                        for eidx in unpinned_list:
-                            raw = read_futures[eidx].result()
+
+                        # Split unpinned into numpy-cache hits vs disk reads
+                        if numpy_cache is not None:
+                            np_cached_list = []
+                            np_uncached_list = []
+                            for eidx in unpinned_list:
+                                nc_key = (i, eidx)
+                                if nc_key in numpy_cache:
+                                    numpy_cache.move_to_end(nc_key)  # LRU touch
+                                    np_cached_list.append((eidx, numpy_cache[nc_key]))
+                                    numpy_cache_hits += 1
+                                else:
+                                    np_uncached_list.append(eidx)
+                                    numpy_cache_misses += 1
+                        else:
+                            np_cached_list = []
+                            np_uncached_list = unpinned_list
+
+                        # Numpy-cache hits: convert raw bytes -> mx.arrays (fast memcpy)
+                        for eidx, raw in np_cached_list:
                             mv = memoryview(raw)
                             attrs = {}
                             for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
@@ -2155,10 +2552,32 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                                     arr = arr.view(mx.bfloat16)
                                 attrs[(proj, attr)] = arr
                             all_expert_attrs[eidx] = attrs
-                            token_io_bytes += es
-                            token_io_seeks += 1
-                            if profile:
-                                layer_io_bytes += es
+
+                        # Numpy-cache misses: pread from packed file
+                        if np_uncached_list:
+                            read_futures = {eidx: _io_pool.submit(os.pread, packed_fd, es, eidx * es)
+                                            for eidx in np_uncached_list}
+                            for eidx in np_uncached_list:
+                                raw = read_futures[eidx].result()
+                                # Store in numpy cache before converting
+                                if numpy_cache is not None:
+                                    nc_key = (i, eidx)
+                                    numpy_cache[nc_key] = raw
+                                    # LRU eviction
+                                    while len(numpy_cache) > numpy_cache_max_entries:
+                                        numpy_cache.popitem(last=False)
+                                mv = memoryview(raw)
+                                attrs = {}
+                                for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                                    arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                                    if is_bf16:
+                                        arr = arr.view(mx.bfloat16)
+                                    attrs[(proj, attr)] = arr
+                                all_expert_attrs[eidx] = attrs
+                                token_io_bytes += es
+                                token_io_seeks += 1
+                                if profile:
+                                    layer_io_bytes += es
                     else:
                         # SCATTERED PATH: 9 preads per expert from safetensors
                         num_unpinned = len(unpinned_list)
@@ -2845,6 +3264,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         "expert_cache_hit_rate": expert_cache.hit_rate if expert_cache is not None else 0.0,
         "expert_cache_entries": len(expert_cache.cache) if expert_cache is not None else 0,
         "no_expert_cache": no_expert_cache,
+        "batch_layers": batch_layers,
         "avg_io_bytes_per_token": avg_bytes,
         "avg_io_seeks_per_token": avg_seeks,
         "avg_io_ms_per_token": avg_io_ms,
@@ -4152,6 +4572,22 @@ def main():
                              "for layer N while GPU processes layer N+1's attention+routing. "
                              "Requires --batch-experts --no-expert-cache and packed expert files. "
                              "Standalone benchmark showed 3.86x speedup (364ms -> 94ms).")
+    parser.add_argument("--skip-layers", type=int, default=0,
+                        help="In layers 10..N-10, keep only every Nth layer (0=disabled). "
+                             "Reduces compute+I/O at the cost of quality. --skip-layers 2 = 40/60 layers.")
+    parser.add_argument("--batch-layers", type=int, default=0,
+                        help="Batch N layers of attention+routing into a single mx.eval() call, "
+                             "then batch-read all needed experts for all N layers at once. "
+                             "Reduces Metal sync overhead from 60 evals to 60/N evals. "
+                             "Routing for layers 2-N in each batch uses approximate h (no expert "
+                             "contribution from prior layers in the batch). 0=disabled. Typical: 4. "
+                             "Requires --batch-experts --no-expert-cache and packed expert files.")
+    parser.add_argument("--numpy-cache-gb", type=float, default=0.0,
+                        help="CPU-side numpy LRU cache for expert raw bytes (GB). When > 0, "
+                             "caches pread results as Python bytes objects in CPU memory (not Metal "
+                             "heap). On hit: memcpy to mx.array (~0.11ms). On miss: pread from "
+                             "packed file (~0.7ms). Requires --no-expert-cache and packed expert "
+                             "files. 0=disabled (default). Typical: 5.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -4176,6 +4612,12 @@ def main():
     if args.async_pipeline and args.mode != "offload_selective":
         print(f"WARNING: --async-pipeline only works with offload_selective mode. Ignoring.")
         args.async_pipeline = False
+
+    # Validate --batch-layers is only used with offload_selective
+    if args.batch_layers > 0 and args.mode != "offload_selective":
+        print(f"WARNING: --batch-layers only works with offload_selective mode. Ignoring.")
+        args.batch_layers = 0
+
     if args.pin_experts > 0 and args.pin_experts >= args.tokens:
         print(f"WARNING: --pin-experts ({args.pin_experts}) >= --tokens ({args.tokens}). "
               f"Need at least 1 token after warmup. Reducing to {args.tokens - 1}.")
@@ -4381,7 +4823,10 @@ def main():
                                             no_expert_cache=args.no_expert_cache,
                                             pin_experts=args.pin_experts,
                                             pin_topk=args.pin_topk,
-                                            async_pipeline=args.async_pipeline)
+                                            async_pipeline=args.async_pipeline,
+                                            skip_layers=args.skip_layers,
+                                            batch_layers=args.batch_layers,
+                                            numpy_cache_gb=args.numpy_cache_gb)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
