@@ -12,3 +12,4 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.83	0	5.5	keep	STABLE: GPU combine+norm 
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.20	0	5.5	keep	4-bit warm cache: 4.20 tok/s sustained! Quality: Imagine you are in a massive library...
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.80	0	5.5	keep	4-bit WARM: 4.80 avg, 5.31 peak. Matches previous 4.74/5.29. Code at parity + 2-bit infra ready.
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.55	0	5.5	keep	2-BIT EXPERTS: 5.55 tok/s sustained 80 tokens! Quality: 'Classic Coin Analogy...light switch...Heads or'. EXCELLENT.
+HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.61	0	5.5	keep	2-BIT 200tok: 5.61 tok/s sustained. Quality: math(255=15*17 CORRECT), code(sorted+key=len), science(plant analogy)
