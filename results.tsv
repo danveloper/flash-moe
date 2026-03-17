@@ -47,3 +47,5 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.55	3116	4.3	discard	speculative prefetc
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	10.10	804	5.8	discard	variable K=0 middle 40 layers - 10 TOK/S ACHIEVED but blank output
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.27	3972	5.8	keep	TWO-PASS OVERLAPPED: routing=42ms io=1ms(!) compute=88ms = 135ms BEST EVER
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.61	2792	6.3	keep	TWO-PASS FINAL: shared expert + overlapped I/O + single eval — 130ms/tok, coherent-ish
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.93	5416	5.4	discard	superset two-pass (h_correction) - 93-99% superset hit but STILL repetitive output
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.73	7674	5.5	discard	cache-restored two-pass - correct attention but 2x compute + 60-88% superset hit = SLOWER
