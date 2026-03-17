@@ -49,3 +49,7 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.27	3972	5.8	keep	TWO-PASS OVERLAPPED: r
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.61	2792	6.3	keep	TWO-PASS FINAL: shared expert + overlapped I/O + single eval — 130ms/tok, coherent-ish
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.93	5416	5.4	discard	superset two-pass (h_correction) - 93-99% superset hit but STILL repetitive output
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.73	7674	5.5	discard	cache-restored two-pass - correct attention but 2x compute + 60-88% superset hit = SLOWER
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.20	0	5.7	keep	K=10 (model default) per-layer — best quality, richest output
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.91	0	5.7	keep	K=6 per-layer — same quality as K=10, 59% faster
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	3.15	2730	5.3	keep	K=4 per-layer 200tok QUALITY BEST — excellent output, all optimizations
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	6.02	3511	4.3	keep	K=4 two-pass 500tok SPEED BEST — coherent but repetitive, I/O=1ms overlapped
