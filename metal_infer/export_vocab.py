@@ -9,6 +9,7 @@ Usage:
     python export_vocab.py <tokenizer.json> [output.bin]
 """
 import json
+import os
 import struct
 import sys
 
@@ -64,7 +65,6 @@ def main():
             if b:
                 f.write(b)
 
-    import os
     sz = os.path.getsize(out_path)
     print(f"Exported vocab.bin: {num_entries} entries (max_id={max_id}), {sz / 1024 / 1024:.1f} MB")
 
