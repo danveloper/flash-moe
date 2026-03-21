@@ -38,7 +38,11 @@ INFER_SRC = infer.m
 CHAT_TARGET = chat
 CHAT_SRC = chat.m
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat
+# Dashboard (htop-style monitor)
+DASHBOARD_TARGET = dashboard
+DASHBOARD_SRC = dashboard.c
+
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run chat-run build-chat dashboard dash-run
 
 all: $(TARGET) $(INFER_TARGET)
 
@@ -63,8 +67,12 @@ $(INFER_TARGET): $(INFER_SRC)
 $(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h
 	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
 
+# Build the dashboard monitor (ncurses)
+$(DASHBOARD_TARGET): $(DASHBOARD_SRC)
+	$(CC) -O2 -Wall $(DASHBOARD_SRC) -lncurses -o $(DASHBOARD_TARGET)
+
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(DASHBOARD_TARGET) $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)
@@ -101,3 +109,7 @@ infer-run: $(INFER_TARGET)
 
 chat-run: $(CHAT_TARGET)
 	./$(CHAT_TARGET) --k 4
+
+# Dashboard targets
+dash-run: $(DASHBOARD_TARGET)
+	./$(DASHBOARD_TARGET)
