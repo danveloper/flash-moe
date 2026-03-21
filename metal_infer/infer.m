@@ -52,6 +52,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/time.h>
 #include <math.h>
 #include <getopt.h>
@@ -124,7 +125,8 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+// MODEL_PATH_DEFAULT is resolved at runtime via get_default_model_path() below
+#define MODEL_PATH_DEFAULT NULL
 
 // ============================================================================
 // Timing helper
@@ -6521,9 +6523,35 @@ static void print_usage(const char *prog) {
     printf("  --help               This message\n");
 }
 
+// Resolve default model path at runtime using $HOME
+static const char *get_default_model_path(void) {
+    static char path[1024];
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    // Find the first snapshot directory
+    char snapshots_dir[1024];
+    snprintf(snapshots_dir, sizeof(snapshots_dir),
+             "%s/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots", home);
+    DIR *d = opendir(snapshots_dir);
+    if (d) {
+        struct dirent *entry;
+        while ((entry = readdir(d)) != NULL) {
+            if (entry->d_name[0] != '.') {
+                snprintf(path, sizeof(path), "%s/%s", snapshots_dir, entry->d_name);
+                closedir(d);
+                return path;
+            }
+        }
+        closedir(d);
+    }
+    snprintf(path, sizeof(path),
+             "%s/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3", home);
+    return path;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
-        const char *model_path = MODEL_PATH_DEFAULT;
+        const char *model_path = get_default_model_path();
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
         const char *vocab_path = NULL;
@@ -6765,15 +6793,10 @@ int main(int argc, char **argv) {
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
-                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
-                    if (layer_mmaps[i] != MAP_FAILED) {
-                        layer_mmap_sizes[i] = st.st_size;
-                        // No madvise: kernel default is best.
-                        // MADV_RANDOM disables readahead (tested: hurts).
-                        // MADV_SEQUENTIAL doesn't reduce I/O fragmentation (tested: no effect).
-                        // The kernel fragments 3.9MB preads into ~5.7 disk ops regardless
-                        // of hints — this is inherent to the page cache's physical page layout.
-                    }
+                    // Skip mmap for expert files — 120GB of mmap reservations
+                    // can trigger OOM kills on systems with memory pressure.
+                    // The engine falls back to pread() which works fine.
+                    layer_mmap_sizes[i] = st.st_size;
                 }
             }
         }

@@ -213,7 +213,7 @@ def write_layout(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', default='/Users/danielwoods/Workspace/ane-research/expert_index.json',
+    parser.add_argument('--index', default='expert_index.json',
                         help='Path to expert_index.json')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')

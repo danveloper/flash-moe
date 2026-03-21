@@ -18,14 +18,17 @@ Binary format:
     For each entry: uint32 token_id, uint16 str_len, char[str_len]
 """
 import json
+import os
 import struct
 import sys
 
 def main():
+    import glob
+    default_tok = glob.glob(os.path.expanduser(
+        '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
+        '/snapshots/*/tokenizer.json'))
     tok_path = sys.argv[1] if len(sys.argv) > 1 else (
-        '/Users/danielwoods/.cache/huggingface/hub/'
-        'models--mlx-community--Qwen3.5-397B-A17B-4bit/'
-        'snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3/tokenizer.json'
+        default_tok[0] if default_tok else 'tokenizer.json'
     )
     out_path = sys.argv[2] if len(sys.argv) > 2 else 'tokenizer.bin'
 

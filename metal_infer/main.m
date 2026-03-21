@@ -40,6 +40,7 @@
 #include <getopt.h>
 #include <pthread.h>
 #include <errno.h>
+#include <dirent.h>
 
 // ============================================================================
 // Constants matching the Qwen3.5-397B packed expert layout
@@ -77,8 +78,8 @@
 
 #define EXPERT_SIZE      7077888   // Total bytes per expert
 
-// Default model path
-#define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+// Default model path — resolved at runtime, can be overridden with --model
+#define MODEL_PATH NULL
 
 // ============================================================================
 // Timing helper
@@ -1504,7 +1505,30 @@ int main(int argc, char **argv) {
         int num_active_experts = 4;  // --k flag
         int do_verify = 0;
         int use_fast = 0;
-        const char *model_path = MODEL_PATH;
+        // Resolve default model path at runtime using $HOME
+        static char default_model_path[1024];
+        const char *home = getenv("HOME");
+        if (!home) home = "/tmp";
+        {
+            char snapshots_dir[1024];
+            snprintf(snapshots_dir, sizeof(snapshots_dir),
+                     "%s/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots", home);
+            DIR *d = opendir(snapshots_dir);
+            if (d) {
+                struct dirent *entry;
+                while ((entry = readdir(d)) != NULL) {
+                    if (entry->d_name[0] != '.') {
+                        snprintf(default_model_path, sizeof(default_model_path), "%s/%s", snapshots_dir, entry->d_name);
+                        break;
+                    }
+                }
+                closedir(d);
+            } else {
+                snprintf(default_model_path, sizeof(default_model_path),
+                         "%s/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3", home);
+            }
+        }
+        const char *model_path = default_model_path;
 
         static struct option long_options[] = {
             {"layer",     required_argument, 0, 'l'},
