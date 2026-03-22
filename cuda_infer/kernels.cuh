@@ -1,0 +1,566 @@
+/*
+ * kernels.cuh — CUDA compute kernels for Flash-MoE inference
+ *
+ * Port of shaders.metal for NVIDIA GPUs (RTX 4090 target).
+ * All kernels operate on the same quantization format:
+ *   - 4-bit affine quantization, group_size=64
+ *   - Weights: uint32 holding 8 x 4-bit values
+ *   - Per-group scale and bias in bfloat16
+ *
+ * Kernel list:
+ *   1. dequant_matvec_4bit_fma  — FMA-optimized 4-bit dequant matvec
+ *   2. swiglu_fused             — SiLU(gate) * up
+ *   3. rms_norm                 — Fused sum-of-squares + normalize (single kernel)
+ *   4. rms_norm_bf16            — RMS norm with bf16 weights
+ *   5. residual_add             — a + b
+ *   6. attn_scores              — Q @ K^T (batched over heads)
+ *   7. attn_softmax             — Softmax over seq_len per head
+ *   8. attn_values              — scores @ V (batched over heads)
+ *   9. sigmoid_gate             — x *= sigmoid(gate)
+ *  10. gated_delta_net_step     — GatedDeltaNet recurrence
+ *  11. conv1d_step              — Depthwise conv1d (kernel=4) + SiLU
+ *  12. rms_norm_qk              — Per-head RMS norm for Q and K
+ *  13. compute_decay_beta       — GatedDeltaNet decay and beta gate
+ *  14. gated_rms_norm           — RMS norm with SiLU gate and bf16 weights
+ *  15. moe_combine_residual     — Weighted expert sum + shared expert + residual
+ */
+
+#pragma once
+#include <cuda_runtime.h>
+#include <cstdint>
+
+#define GROUP_SIZE 64
+
+// ============================================================================
+// BFloat16 helper
+// ============================================================================
+
+__device__ __forceinline__ float bf16_to_f32(uint16_t bf16) {
+    return __uint_as_float((uint32_t)bf16 << 16);
+}
+
+// ============================================================================
+// Warp reduction helpers
+// ============================================================================
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    return val;
+}
+
+// ============================================================================
+// 1. 4-bit FMA dequant matvec
+// ============================================================================
+// blockDim = (32, ROWS_PER_BLOCK), gridDim = ceil(out_dim / ROWS_PER_BLOCK)
+// Shared memory: in_dim * sizeof(float)
+
+#define ROWS_PER_BLOCK 8
+
+__global__ void dequant_matvec_4bit_fma(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ biases,
+    const float*    __restrict__ x,
+    float*          __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    extern __shared__ float x_shared[];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const uint32_t packed_cols = in_dim / 8;
+    const uint32_t num_groups = in_dim / GROUP_SIZE;
+    const uint32_t packed_per_group = GROUP_SIZE / 8;
+
+    // Cooperative load
+    const uint32_t tid = warp_id * 32 + lane;
+    const uint32_t total = blockDim.x * blockDim.y;
+    for (uint32_t i = tid; i < in_dim; i += total)
+        x_shared[i] = x[i];
+    __syncthreads();
+
+    if (row >= out_dim) return;
+
+    const uint32_t* w_row = W_packed + row * packed_cols;
+    const uint16_t* s_row = scales + row * num_groups;
+    const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint32_t col = lane; col < packed_cols; col += 32) {
+        uint32_t g = col / packed_per_group;
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col];
+        uint32_t xb = col * 8;
+
+        float sx0 = scale * x_shared[xb+0]; float bx0 = bias * x_shared[xb+0];
+        float sx1 = scale * x_shared[xb+1]; float bx1 = bias * x_shared[xb+1];
+        float sx2 = scale * x_shared[xb+2]; float bx2 = bias * x_shared[xb+2];
+        float sx3 = scale * x_shared[xb+3]; float bx3 = bias * x_shared[xb+3];
+        float sx4 = scale * x_shared[xb+4]; float bx4 = bias * x_shared[xb+4];
+        float sx5 = scale * x_shared[xb+5]; float bx5 = bias * x_shared[xb+5];
+        float sx6 = scale * x_shared[xb+6]; float bx6 = bias * x_shared[xb+6];
+        float sx7 = scale * x_shared[xb+7]; float bx7 = bias * x_shared[xb+7];
+
+        acc += __fmaf_rn((float)((packed >>  0) & 0xF), sx0, bx0);
+        acc += __fmaf_rn((float)((packed >>  4) & 0xF), sx1, bx1);
+        acc += __fmaf_rn((float)((packed >>  8) & 0xF), sx2, bx2);
+        acc += __fmaf_rn((float)((packed >> 12) & 0xF), sx3, bx3);
+        acc += __fmaf_rn((float)((packed >> 16) & 0xF), sx4, bx4);
+        acc += __fmaf_rn((float)((packed >> 20) & 0xF), sx5, bx5);
+        acc += __fmaf_rn((float)((packed >> 24) & 0xF), sx6, bx6);
+        acc += __fmaf_rn((float)((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+// ============================================================================
+// 2. SwiGLU: out[i] = SiLU(gate[i]) * up[i]
+// ============================================================================
+
+__global__ void swiglu_fused(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ out,
+    uint32_t dim
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+    float g = gate[i];
+    out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
+// ============================================================================
+// 3. RMS Norm (fused: sum_sq + normalize in one kernel)
+// ============================================================================
+// blockDim = 256 (or 1024), gridDim = 1
+// Shared memory: 32 * sizeof(float)
+
+__global__ void rms_norm(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,  // f32 weights
+    float* __restrict__ out,
+    uint32_t dim,
+    float eps
+) {
+    __shared__ float shared[32];
+    float acc = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = x[i];
+        acc += v * v;
+    }
+    // Warp reduce
+    acc = warp_reduce_sum(acc);
+    uint32_t wid = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x % 32;
+    if (lane == 0) shared[wid] = acc;
+    __syncthreads();
+
+    if (wid == 0) {
+        acc = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) shared[0] = acc;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(shared[0] / (float)dim + eps);
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+        out[i] = x[i] * rms * weight[i];
+}
+
+// ============================================================================
+// 4. RMS Norm with bf16 weights
+// ============================================================================
+
+__global__ void rms_norm_bf16(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ weight,
+    float* __restrict__ out,
+    uint32_t dim,
+    float eps
+) {
+    __shared__ float shared[32];
+    float acc = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+        acc += x[i] * x[i];
+
+    acc = warp_reduce_sum(acc);
+    uint32_t wid = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x % 32;
+    if (lane == 0) shared[wid] = acc;
+    __syncthreads();
+    if (wid == 0) {
+        acc = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) shared[0] = acc;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(shared[0] / (float)dim + eps);
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+        out[i] = x[i] * rms * bf16_to_f32(weight[i]);
+}
+
+// ============================================================================
+// 5. Residual add: out = a + b
+// ============================================================================
+
+__global__ void residual_add(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    uint32_t dim
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) out[i] = a[i] + b[i];
+}
+
+// ============================================================================
+// 6. Attention scores: Q @ K^T (batched over heads)
+// ============================================================================
+// Grid: (seq_len * num_heads), Block: 256
+// GQA: heads_per_kv query heads share one KV head
+
+__global__ void attn_scores(
+    const float* __restrict__ Q,        // [num_heads, head_dim]
+    const float* __restrict__ K_cache,  // [max_seq, kv_dim]
+    float* __restrict__ scores,         // [num_heads, seq_stride]
+    uint32_t head_dim, uint32_t kv_dim, uint32_t seq_len,
+    uint32_t seq_stride, float scale, uint32_t heads_per_kv, uint32_t num_seq_tgs
+) {
+    __shared__ float shared[32];
+    uint32_t pos = blockIdx.x % num_seq_tgs;
+    uint32_t h = blockIdx.x / num_seq_tgs;
+    if (pos >= seq_len) return;
+
+    uint32_t kv_h = h / heads_per_kv;
+    const float* qh = Q + h * head_dim;
+    const float* kp = K_cache + pos * kv_dim + kv_h * head_dim;
+
+    float acc = 0.0f;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
+        acc += qh[d] * kp[d];
+
+    acc = warp_reduce_sum(acc);
+    uint32_t wid = threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (lane == 0) shared[wid] = acc;
+    __syncthreads();
+    if (wid == 0) {
+        acc = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) scores[h * seq_stride + pos] = acc * scale;
+    }
+}
+
+// ============================================================================
+// 7. Softmax over seq_len per head
+// ============================================================================
+
+__global__ void attn_softmax(
+    float* __restrict__ scores,  // [num_heads, seq_stride]
+    uint32_t seq_len, uint32_t seq_stride
+) {
+    __shared__ float s_max, s_sum;
+    float* s = scores + blockIdx.x * seq_stride;
+
+    // Max
+    float local_max = -1e30f;
+    for (uint32_t i = threadIdx.x; i < seq_len; i += blockDim.x)
+        local_max = fmaxf(local_max, s[i]);
+
+    __shared__ float shared[32];
+    float wmax = warp_reduce_max(local_max);
+    uint32_t wid = threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (lane == 0) shared[wid] = wmax;
+    __syncthreads();
+    if (wid == 0) {
+        wmax = (lane < (blockDim.x + 31) / 32) ? shared[lane] : -1e30f;
+        wmax = warp_reduce_max(wmax);
+        if (lane == 0) s_max = wmax;
+    }
+    __syncthreads();
+
+    // Exp + sum
+    float local_sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < seq_len; i += blockDim.x) {
+        float v = expf(s[i] - s_max);
+        s[i] = v;
+        local_sum += v;
+    }
+    float wsum = warp_reduce_sum(local_sum);
+    if (lane == 0) shared[wid] = wsum;
+    __syncthreads();
+    if (wid == 0) {
+        wsum = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
+        wsum = warp_reduce_sum(wsum);
+        if (lane == 0) s_sum = wsum;
+    }
+    __syncthreads();
+
+    // Normalize
+    float inv = 1.0f / s_sum;
+    for (uint32_t i = threadIdx.x; i < seq_len; i += blockDim.x)
+        s[i] *= inv;
+}
+
+// ============================================================================
+// 8. Attention values: scores @ V
+// ============================================================================
+
+__global__ void attn_values(
+    const float* __restrict__ scores,  // [num_heads, seq_stride]
+    const float* __restrict__ V_cache, // [max_seq, kv_dim]
+    float* __restrict__ out,           // [num_heads, head_dim]
+    uint32_t head_dim, uint32_t kv_dim, uint32_t seq_len,
+    uint32_t seq_stride, uint32_t heads_per_kv
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t d = tid % head_dim;
+    uint32_t h = tid / head_dim;
+    uint32_t kv_h = h / heads_per_kv;
+    const float* sc = scores + h * seq_stride;
+
+    float acc = 0.0f;
+    for (uint32_t p = 0; p < seq_len; p++)
+        acc += sc[p] * V_cache[p * kv_dim + kv_h * head_dim + d];
+    out[h * head_dim + d] = acc;
+}
+
+// ============================================================================
+// 9. Sigmoid gate: x *= sigmoid(gate)
+// ============================================================================
+
+__global__ void sigmoid_gate(
+    float* __restrict__ x_out,
+    const float* __restrict__ gate,
+    uint32_t dim
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) {
+        float g = 1.0f / (1.0f + expf(-gate[i]));
+        x_out[i] *= g;
+    }
+}
+
+// ============================================================================
+// 10. GatedDeltaNet step (single token, all heads)
+// ============================================================================
+// Grid: 64 (v-heads), Block: 128 (value_dim)
+
+__global__ void gated_delta_net_step(
+    float* __restrict__ state,         // [64 * 128 * 128]
+    const float* __restrict__ q,       // [2048]
+    const float* __restrict__ k,       // [2048]
+    const float* __restrict__ v,       // [8192]
+    const float* __restrict__ g_decay, // [64]
+    const float* __restrict__ beta_gate, // [64]
+    float* __restrict__ output,        // [8192]
+    uint32_t k_heads_per_v             // = 4
+) {
+    uint32_t head_id = blockIdx.x;
+    uint32_t vi = threadIdx.x;
+    uint32_t kh = head_id / k_heads_per_v;
+    float g = g_decay[head_id];
+    float beta = beta_gate[head_id];
+
+    uint32_t state_base = head_id * 128 * 128 + vi * 128;
+    uint32_t k_base = kh * 128;
+    uint32_t v_base = head_id * 128;
+
+    // Decay + memory read
+    float kv_mem = 0.0f;
+    for (uint32_t ki = 0; ki < 128; ki++) {
+        float s = state[state_base + ki] * g;
+        state[state_base + ki] = s;
+        kv_mem += s * k[k_base + ki];
+    }
+
+    // Delta update
+    float delta = (v[v_base + vi] - kv_mem) * beta;
+    for (uint32_t ki = 0; ki < 128; ki++)
+        state[state_base + ki] += k[k_base + ki] * delta;
+
+    // Output
+    float out_val = 0.0f;
+    for (uint32_t ki = 0; ki < 128; ki++)
+        out_val += state[state_base + ki] * q[k_base + ki];
+    output[v_base + vi] = out_val;
+}
+
+// ============================================================================
+// 11. Conv1d step (kernel=4, depthwise, with SiLU)
+// ============================================================================
+
+__global__ void conv1d_step(
+    float* __restrict__ conv_state,     // [3 * conv_dim]
+    const float* __restrict__ input,    // [conv_dim]
+    const uint16_t* __restrict__ weights, // [conv_dim * 4] bf16
+    float* __restrict__ output,         // [conv_dim]
+    uint32_t conv_dim
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= conv_dim) return;
+
+    uint32_t wb = idx * 4;
+    float acc = conv_state[0 * conv_dim + idx] * bf16_to_f32(weights[wb + 0])
+              + conv_state[1 * conv_dim + idx] * bf16_to_f32(weights[wb + 1])
+              + conv_state[2 * conv_dim + idx] * bf16_to_f32(weights[wb + 2]);
+    float inp = input[idx];
+    acc += inp * bf16_to_f32(weights[wb + 3]);
+
+    output[idx] = acc / (1.0f + expf(-acc));  // SiLU
+
+    // Shift history
+    conv_state[0 * conv_dim + idx] = conv_state[1 * conv_dim + idx];
+    conv_state[1 * conv_dim + idx] = conv_state[2 * conv_dim + idx];
+    conv_state[2 * conv_dim + idx] = inp;
+}
+
+// ============================================================================
+// 12. Per-head RMS norm for Q and K
+// ============================================================================
+
+__global__ void rms_norm_qk(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    uint32_t key_dim, float inv_scale
+) {
+    uint32_t head = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t base = head * key_dim;
+
+    // Q norm
+    __shared__ float q_sum;
+    __shared__ float buf[128];
+    float qv = (tid < key_dim) ? q[base + tid] : 0.0f;
+    buf[tid] = qv * qv;
+    __syncthreads();
+    if (tid == 0) { float s = 0; for (uint32_t i = 0; i < key_dim; i++) s += buf[i]; q_sum = s; }
+    __syncthreads();
+    if (tid < key_dim)
+        q[base + tid] = qv * rsqrtf(q_sum / (float)key_dim + 1e-6f) * inv_scale * inv_scale;
+
+    // K norm
+    __shared__ float k_sum;
+    float kv = (tid < key_dim) ? k[base + tid] : 0.0f;
+    buf[tid] = kv * kv;
+    __syncthreads();
+    if (tid == 0) { float s = 0; for (uint32_t i = 0; i < key_dim; i++) s += buf[i]; k_sum = s; }
+    __syncthreads();
+    if (tid < key_dim)
+        k[base + tid] = kv * rsqrtf(k_sum / (float)key_dim + 1e-6f) * inv_scale;
+}
+
+// ============================================================================
+// 13. Compute decay and beta gate for GatedDeltaNet
+// ============================================================================
+
+__global__ void compute_decay_beta(
+    const float* __restrict__ alpha_out,
+    const float* __restrict__ beta_out,
+    const float* __restrict__ A_log,
+    const uint16_t* __restrict__ dt_bias,
+    float* __restrict__ g_decay,
+    float* __restrict__ beta_gate
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float a_val = alpha_out[idx];
+    float dt_b = bf16_to_f32(dt_bias[idx]);
+    float A_val = expf(A_log[idx]);
+    float sp = logf(1.0f + expf(a_val + dt_b));
+    g_decay[idx] = expf(-A_val * sp);
+    beta_gate[idx] = 1.0f / (1.0f + expf(-beta_out[idx]));
+}
+
+// ============================================================================
+// 14. Gated RMS norm: rms_norm(values) * SiLU(z) * weight
+// ============================================================================
+
+__global__ void gated_rms_norm(
+    const float* __restrict__ values,
+    const float* __restrict__ z,
+    const uint16_t* __restrict__ weight,
+    float* __restrict__ output,
+    uint32_t value_dim, float eps
+) {
+    uint32_t head = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t base = head * value_dim;
+
+    __shared__ float buf[128];
+    float val = (tid < value_dim) ? values[base + tid] : 0.0f;
+    buf[tid] = val * val;
+    __syncthreads();
+    if (tid == 0) { float s = 0; for (uint32_t i = 0; i < value_dim; i++) s += buf[i]; buf[0] = s; }
+    __syncthreads();
+    float inv_rms = rsqrtf(buf[0] / (float)value_dim + eps);
+
+    if (tid < value_dim) {
+        float normed = val * inv_rms;
+        float zv = z[base + tid];
+        float gate = zv / (1.0f + expf(-zv));  // SiLU
+        output[base + tid] = normed * gate * bf16_to_f32(weight[tid]);
+    }
+}
+
+// ============================================================================
+// 15. MoE combine + residual + shared expert gate
+// ============================================================================
+// out[i] = h_mid[i] + sum_k(weight[k] * expert_out[k*dim+i]) + sigmoid(shared_gate) * shared[i]
+
+__global__ void moe_combine_residual(
+    const float* __restrict__ h_mid,
+    const float* __restrict__ shared_out,
+    float* __restrict__ hidden_out,
+    const float* __restrict__ expert_outs,  // [K * dim] concatenated
+    const float* __restrict__ weights,      // [K]
+    float shared_gate_score,
+    uint32_t dim, uint32_t K
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+
+    float sg = 1.0f / (1.0f + expf(-shared_gate_score));
+    float moe = 0.0f;
+    for (uint32_t k = 0; k < K; k++)
+        moe += weights[k] * expert_outs[k * dim + i];
+
+    hidden_out[i] = h_mid[i] + moe + sg * shared_out[i];
+}
+
+// ============================================================================
+// Launch helpers
+// ============================================================================
+
+static inline void launch_dequant_matvec(
+    const uint32_t* W, const uint16_t* scales, const uint16_t* biases,
+    const float* x, float* out, uint32_t out_dim, uint32_t in_dim,
+    cudaStream_t stream = 0
+) {
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    size_t smem = in_dim * sizeof(float);
+    dequant_matvec_4bit_fma<<<grid, block, smem, stream>>>(W, scales, biases, x, out, out_dim, in_dim);
+}
+
+static inline void launch_swiglu(const float* gate, const float* up, float* out, uint32_t dim, cudaStream_t s = 0) {
+    swiglu_fused<<<(dim+255)/256, 256, 0, s>>>(gate, up, out, dim);
+}
+
+static inline void launch_rms_norm_bf16(const float* x, const uint16_t* w, float* out, uint32_t dim, float eps, cudaStream_t s = 0) {
+    rms_norm_bf16<<<1, 256, 0, s>>>(x, w, out, dim, eps);
+}
+
+static inline void launch_residual_add(const float* a, const float* b, float* out, uint32_t dim, cudaStream_t s = 0) {
+    residual_add<<<(dim+255)/256, 256, 0, s>>>(a, b, out, dim);
+}
