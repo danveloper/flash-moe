@@ -1357,10 +1357,11 @@ static void sse_send_done(int fd, const char *req_id) {
     http_write_str(fd, chunk);
 }
 
-#define EOS_TOKEN_1 151643  // <|endoftext|>
-#define EOS_TOKEN_2 151645  // <|im_end|>
-#define THINK_START 151667  // <think>
-#define THINK_END   151668  // </think>
+#define EOS_TOKEN_1 248044  // <|endoftext|>
+#define EOS_TOKEN_2 248046  // <|im_end|>
+#define IM_START    248045  // <|im_start|>
+#define THINK_START 248068  // <think>
+#define THINK_END   248069  // </think>
 
 // ============================================================================
 // Tool calling support — extract tools from request, format for Qwen, parse output
@@ -1391,39 +1392,23 @@ static char *extract_tools_json(const char *body) {
 
 // Build a full ChatML prompt from the OpenAI messages array + tools.
 // Returns malloc'd string ready for tokenization.
+// Build a per-request prompt from OpenAI messages array + tools.
+// System prompt is already in KV cache — this only generates the user turn(s).
 static char *build_chat_prompt(const char *body, const char *tools_json) {
-    // Allocate large buffer for the full prompt
     size_t bufsize = strlen(body) * 2 + (tools_json ? strlen(tools_json) * 2 : 0) + 65536;
     char *prompt = (char *)calloc(1, bufsize);
     char *w = prompt;
 
-    // System message with tools (Qwen Hermes format)
-    w += sprintf(w, "<|im_start|>system\nYou are a helpful assistant.");
-
-    // If tools provided, add them in Hermes format
+    // If tools provided, inject as a system addendum before user messages
     if (tools_json) {
-        w += sprintf(w, "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+        w += sprintf(w, "<|im_start|>system\n# Tools\n\n"
+            "You may call one or more functions to assist with the user query.\n\n"
             "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n%s\n</tools>\n\n"
             "For each function call, return a json object with function name and arguments within "
             "<tool_call></tool_call> XML tags:\n<tool_call>\n"
-            "{\"name\": \"<function-name>\", \"arguments\": {<args-json-object>}}\n</tool_call>",
-            tools_json);
+            "{\"name\": \"<function-name>\", \"arguments\": {<args-json-object>}}\n</tool_call>"
+            "<|im_end|>\n", tools_json);
     }
-
-    // Check for custom system prompt
-    const char *home = getenv("HOME");
-    if (home) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/.flash-moe/system.md", home);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-            w += sprintf(w, "\n\n");
-            fread(w, 1, sz, f); w += sz;
-            fclose(f);
-        }
-    }
-    w += sprintf(w, "<|im_end|>\n");
 
     // Parse messages array — find each role/content pair
     const char *msgs = strstr(body, "\"messages\"");
@@ -1734,55 +1719,26 @@ static void anth_send_message_stop(int fd) {
         "data: {\"type\":\"message_stop\"}\n\n");
 }
 
-// Build ChatML prompt from Anthropic Messages API request format
+// Build per-request ChatML prompt from Anthropic Messages API request.
+// System prompt is already in KV cache — this only generates user turn(s) + tools.
 static char *build_anthropic_prompt(const char *body, const char *system_prompt) {
     size_t bufsize = strlen(body) * 2 + 65536;
     char *prompt = (char *)calloc(1, bufsize);
     char *w = prompt;
 
-    // System message
-    w += sprintf(w, "<|im_start|>system\n");
-
-    // Extract top-level "system" field
-    const char *sys_key = strstr(body, "\"system\"");
-    if (sys_key) {
-        const char *sv = sys_key + 8;
-        while (*sv == ' ' || *sv == ':' || *sv == '\t') sv++;
-        if (*sv == '"') {
-            sv++;
-            const char *se = sv;
-            while (*se && !(*se == '"' && *(se-1) != '\\')) se++;
-            // Unescape and write
-            const char *r = sv;
-            while (r < se) {
-                if (*r == '\\' && r + 1 < se) {
-                    r++;
-                    switch (*r) { case 'n': *w++ = '\n'; break; case '"': *w++ = '"'; break;
-                                  case '\\': *w++ = '\\'; break; default: *w++ = *r; break; }
-                    r++;
-                } else *w++ = *r++;
-            }
-        }
-    } else {
-        w += sprintf(w, "%s", system_prompt);
-    }
-
-    // Extract tools and add to system prompt
+    // If tools provided, inject as system addendum
     char *tools_json = extract_tools_json(body);
     if (tools_json) {
-        w += sprintf(w, "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
-            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n");
-        // Convert Anthropic tool format to Hermes format
-        // Anthropic uses input_schema, OpenAI uses parameters — both are JSON Schema
-        w += sprintf(w, "%s", tools_json);
-        w += sprintf(w, "\n</tools>\n\n"
+        w += sprintf(w, "<|im_start|>system\n# Tools\n\n"
+            "You may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+            "%s\n</tools>\n\n"
             "For each function call, return a json object with function name and arguments within "
             "<tool_call></tool_call> XML tags:\n<tool_call>\n"
-            "{\"name\": \"<function-name>\", \"arguments\": {<args-json-object>}}\n</tool_call>");
+            "{\"name\": \"<function-name>\", \"arguments\": {<args-json-object>}}\n</tool_call>"
+            "<|im_end|>\n", tools_json);
         free(tools_json);
     }
-
-    w += sprintf(w, "<|im_end|>\n");
 
     // Parse messages array
     const char *msgs = strstr(body, "\"messages\"");
@@ -1949,16 +1905,69 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
     printf("[serve]   GET  /health\n");
     fflush(stdout);
 
-    // No system prompt pre-caching for now — each request starts fresh.
-    // (The BPE tokenizer doesn't handle special tokens like <|im_start|> natively;
-    //  proper implementation would use added_tokens from the tokenizer.)
-    int sys_pos = 0;
     size_t delta_sz = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
     size_t conv_sz = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
     int kv_dim = NUM_KV_HEADS * HEAD_DIM;
 
+    // ---- System prompt pre-cache ----
+    // Tokenize and prefill the system prompt once at startup.
+    // Snapshot the resulting state so each request restores from here
+    // instead of starting from scratch (~8s saved per request).
+    const char *sys_text = "You are a helpful assistant.";
+    {
+        const char *home = getenv("HOME");
+        if (home) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/.flash-moe/system.md", home);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                char *buf = (char *)malloc(sz + 1);
+                buf[fread(buf, 1, sz, f)] = 0;
+                fclose(f);
+                sys_text = buf;
+                fprintf(stderr, "[serve] Custom system prompt from %s (%ld bytes)\n", path, sz);
+            }
+        }
+    }
+
+    // Build system prompt in ChatML format
+    char *sys_chatml = (char *)malloc(strlen(sys_text) + 256);
+    sprintf(sys_chatml, "<|im_start|>system\n%s<|im_end|>\n", sys_text);
+
+    uint32_t sys_ids[4096];
+    int sys_ntokens = bpe_encode(tokenizer, sys_chatml, sys_ids, 4096);
+    free(sys_chatml);
+
+    fprintf(stderr, "[serve] System prompt: %d tokens, prefilling...\n", sys_ntokens);
+    double t_prefill = now_ms();
+    for (int i = 0; i < sys_ntokens; i++)
+        forward(model, sys_ids[i], i, K);
+    int sys_pos = sys_ntokens;
+    fprintf(stderr, "[serve] System prompt cached in %.0f ms\n", now_ms() - t_prefill);
+
+    // Snapshot KV caches + delta-net + conv states after system prompt
+    void *snap_kv_k[NUM_LAYERS] = {}, *snap_kv_v[NUM_LAYERS] = {};
+    int snap_kv_len[NUM_LAYERS] = {};
+    void *snap_delta[NUM_LAYERS] = {}, *snap_conv[NUM_LAYERS] = {};
+
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (model->layers[i].is_full) {
+            size_t sz = sys_pos * kv_dim * sizeof(float);
+            snap_kv_k[i] = malloc(sz); snap_kv_v[i] = malloc(sz);
+            CHECK_CUDA(cudaMemcpy(snap_kv_k[i], model->kv_k[i], sz, cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(snap_kv_v[i], model->kv_v[i], sz, cudaMemcpyDeviceToHost));
+            snap_kv_len[i] = model->kv_len[i];
+        } else {
+            snap_delta[i] = malloc(delta_sz); snap_conv[i] = malloc(conv_sz);
+            CHECK_CUDA(cudaMemcpy(snap_delta[i], model->delta_state[i], delta_sz, cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(snap_conv[i], model->conv_state[i], conv_sz, cudaMemcpyDeviceToHost));
+        }
+    }
+    fprintf(stderr, "[serve] State snapshot saved (%d layers)\n", NUM_LAYERS);
+
     uint64_t req_counter = 0;
-    fprintf(stderr, "[serve] Ready (no system prompt cache — each request starts fresh)\n");
+    fprintf(stderr, "[serve] Ready\n");
 
     static const char *SSE_HEADERS =
         "HTTP/1.1 200 OK\r\n"
@@ -2033,13 +2042,18 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             fprintf(stderr, "[serve] %s max_tokens=%d tools=%s\n",
                     request_id, max_gen, tools_json ? "yes" : "no");
 
-            // Reset state for fresh request
+            // Restore state from system prompt snapshot
             for (int i = 0; i < NUM_LAYERS; i++) {
                 if (model->layers[i].is_full) {
-                    model->kv_len[i] = 0;
+                    size_t sz = snap_kv_len[i] * kv_dim * sizeof(float);
+                    if (sz > 0) {
+                        CHECK_CUDA(cudaMemcpy(model->kv_k[i], snap_kv_k[i], sz, cudaMemcpyHostToDevice));
+                        CHECK_CUDA(cudaMemcpy(model->kv_v[i], snap_kv_v[i], sz, cudaMemcpyHostToDevice));
+                    }
+                    model->kv_len[i] = snap_kv_len[i];
                 } else {
-                    CHECK_CUDA(cudaMemset(model->delta_state[i], 0, delta_sz));
-                    CHECK_CUDA(cudaMemset(model->conv_state[i], 0, conv_sz));
+                    CHECK_CUDA(cudaMemcpy(model->delta_state[i], snap_delta[i], delta_sz, cudaMemcpyHostToDevice));
+                    CHECK_CUDA(cudaMemcpy(model->conv_state[i], snap_conv[i], conv_sz, cudaMemcpyHostToDevice));
                 }
             }
 
@@ -2081,18 +2095,9 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             // Special token IDs to suppress from output
             // These are Qwen3.5 special token IDs that should not appear as content
             int suppress_tokens[] = {
-                151643, // <|endoftext|>
-                151644, // <|im_start|>
-                151645, // <|im_end|>
-                151646, // <|object_ref_start|>
-                151647, // <|object_ref_end|>
-                151648, // <|quad_start|>
-                151649, // <|quad_end|>
-                151650, // <|vision_start|>
-                151651, // <|vision_end|>
-                151652, // <|vision_pad|>
-                151653, // <|image_pad|>
-                151654, // <|video_pad|>
+                EOS_TOKEN_1,  // <|endoftext|>
+                IM_START,     // <|im_start|>
+                EOS_TOKEN_2,  // <|im_end|>
             };
             int n_suppress = sizeof(suppress_tokens) / sizeof(suppress_tokens[0]);
 
