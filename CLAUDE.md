@@ -1,3 +1,103 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+**NOTE:** README.md is a symlink to this file. Keep content useful for both Claude Code and GitHub readers.
+
+## Build & Run
+
+Two backends: `metal_infer/` for Apple Silicon, `cuda_infer/` for NVIDIA GPUs.
+
+### CUDA backend (NVIDIA GPUs)
+
+See [`cuda_infer/README.md`](cuda_infer/README.md) for full documentation. Quick start:
+
+```bash
+cd cuda_infer
+make                  # requires CUDA 12.8+ and libcufile
+./infer --prompt "Hello" --tokens 20
+```
+
+### Metal backend (Apple Silicon)
+
+All binaries are built from `metal_infer/`. Metal shaders compile at runtime (no offline metal compiler needed).
+
+```bash
+cd metal_infer
+make              # builds metal_infer (benchmark) + infer (inference engine)
+make chat         # builds chat TUI client (separate target)
+make clean        # remove build artifacts
+```
+
+### Inference engine (`infer`)
+
+```bash
+./infer --prompt "Hello" --tokens 50              # basic generation
+./infer --prompt "Hello" --tokens 50 --2bit       # 2-bit mode (faster, breaks JSON)
+./infer --prompt "Hello" --tokens 20 --timing     # per-layer timing breakdown
+./infer --serve 8080                              # HTTP server (OpenAI-compatible API)
+./infer --prompt "Hello" --tokens 20 --freq       # expert frequency tracking
+./infer --prompt "Hello" --tokens 20 --cache-telemetry  # cold vs eviction miss analysis
+```
+
+### Chat TUI (`chat`)
+
+Thin HTTP/SSE client that connects to the inference server. Sessions persist to `~/.flash-moe/sessions/<id>.jsonl`.
+
+```bash
+./chat                          # connect to default port
+./chat --port 8000              # specify server port
+./chat --show-think             # show thinking tokens
+./chat --resume <session_id>    # resume previous session
+```
+
+### Custom system prompt
+
+Place a file at `~/.flash-moe/system.md` to override the default system prompt used by the serve mode.
+
+### MoE benchmark (`metal_infer`)
+
+```bash
+make run           # single expert forward pass
+make verify        # Metal vs CPU reference verification
+make bench         # benchmark single expert (10 iterations)
+make moe           # full MoE forward pass (K experts, single layer)
+make full          # full 60-layer forward pass (K=4)
+make fullbench     # benchmark full 60-layer forward (3 iterations)
+```
+
+## Code Architecture
+
+Three Objective-C files, one Metal shader file, one C header — no frameworks, no dependencies beyond Apple system libraries.
+
+- **`infer.m`** (~7000 lines) — The entire inference engine in one file: model loading, Metal pipeline setup, all 60-layer forward pass, tokenization, sampling, HTTP server (OpenAI-compatible SSE), tool calling, KV cache management. This is the core of the project.
+- **`shaders.metal`** (~1200 lines) — All Metal compute kernels: 4-bit/2-bit dequant matvec (multiple optimization levels), SwiGLU, RMS norm, attention (Q@K^T, softmax, scores@V), RoPE, MoE combine+residual.
+- **`chat.m`** — Thin HTTP/SSE client with linenoise line editing. Connects to the `--serve` mode of `infer`. No model logic.
+- **`main.m`** — Standalone MoE benchmark. Tests expert forward pass in isolation, verifies Metal vs CPU.
+- **`tokenizer.h`** — Single-header C BPE tokenizer (449 lines).
+
+### Key design constraints
+
+- **Single-file engine**: All inference logic lives in `infer.m`. This is intentional — the entire forward pass, server, and tool calling in one file for simplicity.
+- **No custom caching**: Expert data relies entirely on the OS page cache ("Trust the OS"). Every custom cache we tried was slower.
+- **Serial GPU→SSD→GPU pipeline**: On Apple Silicon unified memory, SSD DMA and GPU compute share the memory controller. Overlapping them causes GPU latency spikes. The serial pipeline is hardware-optimal.
+- **Metal shaders compile at runtime** via `MTLDevice newLibraryWithSource:`. No offline `.metallib` needed (though `make metallib` exists as an option).
+
+### Per-layer pipeline (3 command buffers)
+
+```
+CMD3(prev) → CMD1: attention projections + delta-net  [GPU]
+           → CPU: flush results
+           → CMD2: o_proj + norm + routing + shared    [GPU]
+           → CPU: softmax + topK routing
+           → I/O: parallel pread K=4 experts           [SSD]
+           → CMD3: expert forward + combine + norm     [GPU, DEFERRED]
+```
+
+CMD3 is submitted without waiting (deferred). The GPU serializes CMD3(N-1) then CMD1(N) via queue ordering.
+
+---
+
 # Flash-MoE: Running a 397B Parameter Model on a Laptop
 
 > **[Read the paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built this in 24 hours.
