@@ -102,9 +102,12 @@ Start the server with `--serve PORT`:
 
 ### Endpoints
 
-- `POST /v1/chat/completions` — Chat completions with SSE streaming
+- `POST /v1/chat/completions` — OpenAI Chat Completions API (SSE streaming)
+- `POST /v1/messages` — Anthropic Messages API (SSE streaming)
 - `GET /v1/models` — List available models
 - `GET /health` — Health check
+
+Both chat endpoints support tool calling and produce correct streaming events for their respective formats.
 
 ### Basic chat
 
@@ -173,22 +176,20 @@ curl -N http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-### Using with Claude Code via litellm
+### Using with Claude Code
 
-Claude Code uses the Anthropic Messages API format, not OpenAI. To bridge them, use [litellm](https://github.com/BerriAI/litellm) as a proxy:
+The server natively supports the Anthropic Messages API (`POST /v1/messages`) — no proxy needed:
 
 ```bash
 # Start the Flash-MoE server
-./infer --serve 9090
+./infer --serve 8080
 
-# Install and start litellm proxy
-pip install litellm
-litellm --model openai/qwen3.5-397b --api_base http://localhost:9090/v1 --port 4000
-
-# Point Claude Code at litellm
-export ANTHROPIC_BASE_URL=http://localhost:4000
-claude --model qwen3.5-397b
+# Point Claude Code at it
+export ANTHROPIC_BASE_URL=http://localhost:8080
+claude --model qwen3.5-397b-a17b
 ```
+
+This gives you a 397B parameter model with tool calling running locally through Claude Code's agent framework — reading files, running commands, editing code — all on a single GPU.
 
 ### Using with other OpenAI-compatible clients
 
