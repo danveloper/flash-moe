@@ -14,20 +14,20 @@ SSD (203GB experts) ──GDS──> GPU VRAM (24GB)
 CPU RAM (page cache) ←──────> GPU compute
 ```
 
-Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB each) from SSD. NVIDIA GPUDirect Storage (GDS) enables direct NVMe-to-GPU DMA transfers, bypassing the CPU.
+Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB each) from SSD. The OS page cache (using available system RAM) automatically caches frequently-accessed experts — with 64GB RAM, roughly half the expert data stays in cache after warm-up, cutting average I/O time from 5.8ms to ~3ms per layer. GDS (direct NVMe-to-GPU DMA) is available as an option for low-RAM systems via `ENABLE_GDS=1`.
 
 ## Results
 
 | Configuration | tok/s | Hardware | Notes |
 |--------------|-------|----------|-------|
-| **Flash-MoE CUDA (GDS)** | **2.45** | 1x RTX 4090, 64GB RAM, 2TB NVMe | This project. Direct SSD→GPU. |
+| **Flash-MoE CUDA** | **2.52** | 1x RTX 4090, 64GB RAM, 2TB NVMe | This project. Page cache + SSD streaming. |
 | Flash-MoE Metal (Apple) | 4.36 | M3 Max 48GB, 1TB NVMe | Original project. Unified memory. |
 
 ### Comparison with Other Solutions
 
 | System | Qwen3.5-397B | Hardware Required | Approach |
 |--------|-------------|-------------------|----------|
-| **Flash-MoE CUDA** | **2.45 tok/s** | **1x RTX 4090 + 16GB+ RAM + NVMe** | SSD expert streaming, GDS |
+| **Flash-MoE CUDA** | **2.52 tok/s** | **1x RTX 4090 + 16GB+ RAM + NVMe** | SSD streaming + page cache |
 | KTransformers | ~14 tok/s* | 1x RTX 4090 + **384GB RAM** | CPU expert compute (AMX), GPU attention |
 | llama.cpp (offload) | ~1-2 tok/s | 1x RTX 4090 + **256GB RAM** | CPU/GPU layer split, GGUF |
 | KTransformers (full) | ~150 tok/s | **4x RTX 4090 + 800GB RAM** | Multi-GPU tensor parallelism |
@@ -39,7 +39,7 @@ Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB e
 ## Hardware Requirements
 
 - **GPU**: NVIDIA GPU with 16GB+ VRAM (tested on RTX 4090)
-- **RAM**: 16GB minimum, 32GB+ recommended (process uses 5.5GB; extra RAM improves page cache hit rate)
+- **RAM**: 16GB minimum, 64GB+ recommended (process uses 5.5GB; extra RAM serves as page cache for experts — 64GB caches ~50% of expert data, significantly improving throughput)
 - **SSD**: NVMe SSD with 250GB+ free space, PCIe 4.0+ recommended
 - **CUDA**: 12.8+ with GDS support (optional but recommended)
 - **OS**: Linux (tested on Ubuntu 24.04)
@@ -261,7 +261,7 @@ Measured on RTX 4090 + Samsung 990 EVO Plus (PCIe 4.0 x4):
 | Warm cache (page cache hit) | 2.7 ms | 10.4 GB/s |
 | GPU dequant K=4 experts | 0.08 ms | negligible |
 
-GDS provides a **37% speedup** over the traditional pread+cudaMemcpy path by enabling direct NVMe-to-GPU DMA transfers.
+For cold reads, GDS is 37% faster than pread+cudaMemcpy. However, **pread with page cache** is the default because hot experts cached in RAM (2.7ms) beat GDS cold reads (5.3ms). With 64GB RAM, the page cache grows to ~50GB during sustained generation, caching roughly half the expert data. Set `ENABLE_GDS=1` to force GDS on low-RAM systems.
 
 ### Key Differences from Apple Silicon Version
 
