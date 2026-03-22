@@ -992,8 +992,20 @@ static void apply_rope(float *q, float *k, int pos) {
 // Per-layer forward pass
 // ============================================================================
 
+// Timing accumulator for per-phase breakdown
+static int g_timing_enabled = 0;
+static struct {
+    double input_norm, attn_proj, attn_compute, oproj_residual;
+    double routing, shared_expert, expert_io, expert_compute, combine;
+    double total;
+    int count;
+} g_layer_timing;
+
 static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     auto &L = model->layers[layer_idx];
+    double t0, t1;
+
+    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t0 = now_ms(); }
 
     // 1. Input RMS norm
     launch_rms_norm_bf16(model->buf_hidden, L.input_norm_w, model->buf_normed,
@@ -1002,6 +1014,8 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     // Save residual
     CHECK_CUDA(cudaMemcpy(model->buf_residual, model->buf_hidden,
                           HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
+
+    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.input_norm += t1-t0; t0=t1; }
 
     // 2. Attention projections + attention compute
     if (L.is_full) {
@@ -1149,10 +1163,14 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                               HIDDEN_DIM, LINEAR_TOTAL_VALUE);
     }
 
+    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.attn_compute += t1-t0; t0=t1; }
+
     // 3. Residual + post-attention norm
     launch_residual_add(model->buf_residual, model->buf_h_mid, model->buf_h_mid, HIDDEN_DIM);
     launch_rms_norm_bf16(model->buf_h_mid, L.post_attn_norm_w, model->buf_normed,
                          HIDDEN_DIM, RMS_NORM_EPS);
+
+    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.oproj_residual += t1-t0; t0=t1; }
 
     // 4. MoE routing
     launch_dequant_matvec(L.gate_w, L.gate_s, L.gate_b, model->buf_normed,
@@ -1166,6 +1184,8 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     int expert_ids[MAX_K];
     float expert_weights[MAX_K];
     topk(h_scores, NUM_EXPERTS, K, expert_ids, expert_weights);
+
+    if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.routing += t1-t0; t0=t1; }
 
     // 5. Shared expert forward + expert I/O OVERLAP
     // Launch shared expert on GPU compute stream while loading experts from SSD
@@ -1182,8 +1202,12 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     launch_dequant_matvec(L.seg_w, L.seg_s, L.seg_b, model->buf_normed,
                           model->buf_gate_scores, 1, HIDDEN_DIM);
 
+    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.shared_expert += t1-t0; t0=t1; }
+
     // 6. Load K experts from SSD (overlaps with shared expert GPU work above)
     load_experts(model, layer_idx, expert_ids, K);
+
+    if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.expert_io += t1-t0; t0=t1; }
 
     // 7. Expert forward (K experts on GPU)
     for (int k = 0; k < K; k++) {
@@ -1198,10 +1222,16 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     CHECK_CUDA(cudaMemcpy(model->buf_expert_weights, expert_weights,
                           K * sizeof(float), cudaMemcpyHostToDevice));
 
+    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.expert_compute += t1-t0; t0=t1; }
+
     moe_combine_residual<<<(HIDDEN_DIM + 255) / 256, 256>>>(
         model->buf_h_mid, model->buf_shared_out, model->buf_hidden,
         model->buf_expert_outs, model->buf_expert_weights, h_seg_score,
         HIDDEN_DIM, K);
+
+    if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.combine += t1-t0;
+        g_layer_timing.count++;
+    }
 }
 
 // ============================================================================
@@ -1212,9 +1242,25 @@ static int forward(Model *model, int token_id, int pos, int K) {
     // Embedding
     embed_token(model, token_id);
 
+    // Reset timing
+    if (g_timing_enabled) memset(&g_layer_timing, 0, sizeof(g_layer_timing));
+
     // 60 layers
     for (int i = 0; i < NUM_LAYERS; i++) {
         layer_forward(model, i, pos, K);
+    }
+
+    // Print timing summary
+    if (g_timing_enabled && g_layer_timing.count > 0) {
+        int n = g_layer_timing.count;
+        fprintf(stderr, "[timing] Per-layer avg (%.0f layers): "
+                "norm=%.2f attn=%.2f oproj=%.2f route=%.2f "
+                "shared=%.2f io=%.2f expert=%.2f combine=%.2f ms\n",
+                (double)n,
+                g_layer_timing.input_norm/n, g_layer_timing.attn_compute/n,
+                g_layer_timing.oproj_residual/n, g_layer_timing.routing/n,
+                g_layer_timing.shared_expert/n, g_layer_timing.expert_io/n,
+                g_layer_timing.expert_compute/n, g_layer_timing.combine/n);
     }
 
     // Final RMS norm
@@ -2485,7 +2531,7 @@ int main(int argc, char **argv) {
             case 't': max_tokens = atoi(optarg); break;
             case 'k': K = atoi(optarg); break;
             case 'S': serve_port = atoi(optarg); break;
-            case 'M': timing = 1; break;
+            case 'M': timing = 1; g_timing_enabled = 1; break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
                 printf("  --weights PATH   model_weights.bin\n");
