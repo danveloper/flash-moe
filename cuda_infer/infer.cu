@@ -1628,6 +1628,298 @@ static int parse_tool_call(const char *text, char *name, int name_sz, char *args
     return 1;
 }
 
+// ============================================================================
+// Anthropic Messages API — SSE helpers
+// ============================================================================
+
+static void anth_send_message_start(int fd, const char *msg_id, const char *model_name) {
+    char buf[2048];
+    int n = snprintf(buf, sizeof(buf),
+        "event: message_start\n"
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\","
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"%s\","
+        "\"stop_reason\":null,\"stop_sequence\":null,"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+        msg_id, model_name);
+    http_write_str(fd, buf);
+}
+
+static void anth_send_content_block_start(int fd, int index, const char *type) {
+    char buf[512];
+    if (strcmp(type, "text") == 0) {
+        snprintf(buf, sizeof(buf),
+            "event: content_block_start\n"
+            "data: {\"type\":\"content_block_start\",\"index\":%d,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n", index);
+    }
+    http_write_str(fd, buf);
+}
+
+static void anth_send_content_block_start_tool(int fd, int index, const char *tool_id,
+                                                const char *func_name) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf),
+        "event: content_block_start\n"
+        "data: {\"type\":\"content_block_start\",\"index\":%d,"
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"%s\",\"name\":\"%s\",\"input\":{}}}\n\n",
+        index, tool_id, func_name);
+    http_write_str(fd, buf);
+}
+
+static int anth_send_text_delta(int fd, int index, const char *text) {
+    char chunk[4096], escaped[2048];
+    char *w = escaped;
+    for (const char *r = text; *r && w < escaped + sizeof(escaped) - 8; r++) {
+        switch (*r) {
+            case '"': *w++ = '\\'; *w++ = '"'; break;
+            case '\\': *w++ = '\\'; *w++ = '\\'; break;
+            case '\n': *w++ = '\\'; *w++ = 'n'; break;
+            case '\r': *w++ = '\\'; *w++ = 'r'; break;
+            case '\t': *w++ = '\\'; *w++ = 't'; break;
+            default: *w++ = *r; break;
+        }
+    }
+    *w = '\0';
+    int n = snprintf(chunk, sizeof(chunk),
+        "event: content_block_delta\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":%d,"
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"%s\"}}\n\n",
+        index, escaped);
+    ssize_t wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
+}
+
+static int anth_send_tool_input_delta(int fd, int index, const char *json_delta) {
+    char chunk[8192], escaped[4096];
+    char *w = escaped;
+    for (const char *r = json_delta; *r && w < escaped + sizeof(escaped) - 8; r++) {
+        switch (*r) {
+            case '"': *w++ = '\\'; *w++ = '"'; break;
+            case '\\': *w++ = '\\'; *w++ = '\\'; break;
+            case '\n': *w++ = '\\'; *w++ = 'n'; break;
+            default: *w++ = *r; break;
+        }
+    }
+    *w = '\0';
+    int n = snprintf(chunk, sizeof(chunk),
+        "event: content_block_delta\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":%d,"
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"%s\"}}\n\n",
+        index, escaped);
+    ssize_t wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
+}
+
+static void anth_send_content_block_stop(int fd, int index) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "event: content_block_stop\n"
+        "data: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", index);
+    http_write_str(fd, buf);
+}
+
+static void anth_send_message_delta(int fd, const char *stop_reason, int output_tokens) {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "event: message_delta\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":null},"
+        "\"usage\":{\"output_tokens\":%d}}\n\n",
+        stop_reason, output_tokens);
+    http_write_str(fd, buf);
+}
+
+static void anth_send_message_stop(int fd) {
+    http_write_str(fd,
+        "event: message_stop\n"
+        "data: {\"type\":\"message_stop\"}\n\n");
+}
+
+// Build ChatML prompt from Anthropic Messages API request format
+static char *build_anthropic_prompt(const char *body, const char *system_prompt) {
+    size_t bufsize = strlen(body) * 2 + 65536;
+    char *prompt = (char *)calloc(1, bufsize);
+    char *w = prompt;
+
+    // System message
+    w += sprintf(w, "<|im_start|>system\n");
+
+    // Extract top-level "system" field
+    const char *sys_key = strstr(body, "\"system\"");
+    if (sys_key) {
+        const char *sv = sys_key + 8;
+        while (*sv == ' ' || *sv == ':' || *sv == '\t') sv++;
+        if (*sv == '"') {
+            sv++;
+            const char *se = sv;
+            while (*se && !(*se == '"' && *(se-1) != '\\')) se++;
+            // Unescape and write
+            const char *r = sv;
+            while (r < se) {
+                if (*r == '\\' && r + 1 < se) {
+                    r++;
+                    switch (*r) { case 'n': *w++ = '\n'; break; case '"': *w++ = '"'; break;
+                                  case '\\': *w++ = '\\'; break; default: *w++ = *r; break; }
+                    r++;
+                } else *w++ = *r++;
+            }
+        }
+    } else {
+        w += sprintf(w, "%s", system_prompt);
+    }
+
+    // Extract tools and add to system prompt
+    char *tools_json = extract_tools_json(body);
+    if (tools_json) {
+        w += sprintf(w, "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n");
+        // Convert Anthropic tool format to Hermes format
+        // Anthropic uses input_schema, OpenAI uses parameters — both are JSON Schema
+        w += sprintf(w, "%s", tools_json);
+        w += sprintf(w, "\n</tools>\n\n"
+            "For each function call, return a json object with function name and arguments within "
+            "<tool_call></tool_call> XML tags:\n<tool_call>\n"
+            "{\"name\": \"<function-name>\", \"arguments\": {<args-json-object>}}\n</tool_call>");
+        free(tools_json);
+    }
+
+    w += sprintf(w, "<|im_end|>\n");
+
+    // Parse messages array
+    const char *msgs = strstr(body, "\"messages\"");
+    if (!msgs) { w += sprintf(w, "<|im_start|>assistant\n"); return prompt; }
+    const char *arr = strchr(msgs, '[');
+    if (!arr) { w += sprintf(w, "<|im_start|>assistant\n"); return prompt; }
+
+    // Iterate messages — Anthropic format:
+    // {"role": "user"/"assistant", "content": "string" or [{"type":"text","text":"..."},{"type":"tool_result",...}]}
+    const char *p = arr + 1;
+    while (*p) {
+        const char *role_key = strstr(p, "\"role\"");
+        if (!role_key) break;
+        const char *role_val = strchr(role_key + 6, '"');
+        if (!role_val) break;
+        role_val++;
+        const char *role_end = strchr(role_val, '"');
+        if (!role_end) break;
+
+        char role[32] = {};
+        size_t rlen = role_end - role_val;
+        if (rlen >= sizeof(role)) rlen = sizeof(role) - 1;
+        memcpy(role, role_val, rlen);
+
+        // Find content
+        const char *content_key = strstr(role_end, "\"content\"");
+        if (!content_key) { p = role_end + 1; continue; }
+        const char *cv = content_key + 9;
+        while (*cv == ' ' || *cv == ':' || *cv == '\t') cv++;
+
+        if (*cv == '"') {
+            // Simple string content
+            cv++;
+            const char *ce = cv;
+            while (*ce && !(*ce == '"' && *(ce-1) != '\\')) ce++;
+
+            w += sprintf(w, "<|im_start|>%s\n", role);
+            const char *r = cv;
+            while (r < ce) {
+                if (*r == '\\' && r + 1 < ce) {
+                    r++;
+                    switch (*r) { case 'n': *w++ = '\n'; break; case 't': *w++ = '\t'; break;
+                                  case '"': *w++ = '"'; break; case '\\': *w++ = '\\'; break;
+                                  default: *w++ = '\\'; *w++ = *r; break; }
+                    r++;
+                } else *w++ = *r++;
+            }
+            w += sprintf(w, "<|im_end|>\n");
+            p = ce + 1;
+        } else if (*cv == '[') {
+            // Array content — may contain text blocks and tool_result blocks
+            w += sprintf(w, "<|im_start|>%s\n", role);
+            // Find matching ]
+            int depth = 1;
+            const char *as = cv + 1;
+            while (*as && depth > 0) {
+                if (*as == '[') depth++;
+                else if (*as == ']') depth--;
+                if (depth > 0) as++;
+            }
+            // Scan for text and tool_result blocks within the array
+            const char *scan = cv + 1;
+            while (scan < as) {
+                const char *type_key = strstr(scan, "\"type\"");
+                if (!type_key || type_key >= as) break;
+                const char *tv = strchr(type_key + 6, '"');
+                if (!tv || tv >= as) break;
+                tv++;
+                if (strncmp(tv, "text\"", 5) == 0) {
+                    // Find "text" field
+                    const char *tk = strstr(tv, "\"text\"");
+                    if (tk && tk < as) {
+                        const char *tval = strchr(tk + 6, '"');
+                        if (tval) { tval++;
+                            const char *te = tval;
+                            while (*te && !(*te == '"' && *(te-1) != '\\')) te++;
+                            const char *r = tval;
+                            while (r < te) {
+                                if (*r == '\\' && r + 1 < te) { r++;
+                                    switch (*r) { case 'n': *w++ = '\n'; break; case '"': *w++ = '"'; break;
+                                                  case '\\': *w++ = '\\'; break; default: *w++ = *r; break; }
+                                    r++;
+                                } else *w++ = *r++;
+                            }
+                            scan = te + 1;
+                            continue;
+                        }
+                    }
+                } else if (strncmp(tv, "tool_use\"", 9) == 0) {
+                    // Tool use block from assistant — add as <tool_call>
+                    w += sprintf(w, "<tool_call>\n");
+                    const char *nk = strstr(tv, "\"name\"");
+                    if (nk && nk < as) {
+                        const char *nv = strchr(nk + 6, '"'); if (nv) { nv++;
+                            const char *ne = strchr(nv, '"');
+                            if (ne) { w += sprintf(w, "{\"name\": \""); memcpy(w, nv, ne-nv); w += (ne-nv); w += sprintf(w, "\", \"arguments\": "); }
+                        }
+                    }
+                    const char *ik = strstr(tv, "\"input\"");
+                    if (ik && ik < as) {
+                        const char *iv = strchr(ik + 7, '{');
+                        if (iv) { int d = 1; const char *ie = iv + 1;
+                            while (*ie && d > 0) { if (*ie == '{') d++; else if (*ie == '}') d--; ie++; }
+                            memcpy(w, iv, ie - iv); w += (ie - iv);
+                        }
+                    }
+                    w += sprintf(w, "}\n</tool_call>");
+                    scan = tv + 9;
+                    continue;
+                } else if (strncmp(tv, "tool_result\"", 12) == 0) {
+                    // Tool result — extract content
+                    w += sprintf(w, "[Tool result]: ");
+                    const char *ck = strstr(tv, "\"content\"");
+                    if (ck && ck < as) {
+                        const char *cval = strchr(ck + 9, '"');
+                        if (cval) { cval++;
+                            const char *ce = cval;
+                            while (*ce && !(*ce == '"' && *(ce-1) != '\\')) ce++;
+                            memcpy(w, cval, ce - cval); w += (ce - cval);
+                            scan = ce + 1;
+                            continue;
+                        }
+                    }
+                }
+                scan = tv + 5;
+            }
+            w += sprintf(w, "<|im_end|>\n");
+            p = as + 1;
+        } else {
+            p = cv + 1;
+        }
+    }
+
+    w += sprintf(w, "<|im_start|>assistant\n");
+    return prompt;
+}
+
 static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokenizer,
                        int port, int K) {
     signal(SIGPIPE, SIG_IGN);
@@ -1650,7 +1942,11 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
     }
 
     printf("[serve] Listening on http://0.0.0.0:%d\n", port);
-    printf("[serve] Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health\n");
+    printf("[serve] Endpoints:\n");
+    printf("[serve]   POST /v1/chat/completions  (OpenAI format)\n");
+    printf("[serve]   POST /v1/messages          (Anthropic format)\n");
+    printf("[serve]   GET  /v1/models\n");
+    printf("[serve]   GET  /health\n");
     fflush(stdout);
 
     // No system prompt pre-caching for now — each request starts fresh.
@@ -1890,6 +2186,167 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                     request_id, gen_count, gen_ms,
                     gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0.0,
                     tool_call_count > 0 ? " [tool_calls]" : "");
+
+            free(reqbuf); close(client_fd); continue;
+        }
+
+        // POST /v1/messages (Anthropic Messages API)
+        if (strcmp(method, "POST") == 0 && strcmp(path_buf, "/v1/messages") == 0) {
+            char *body = strstr(reqbuf, "\r\n\r\n");
+            if (!body) {
+                http_write_str(client_fd, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\":\"no body\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+            body += 4;
+
+            int max_gen = extract_max_tokens(body, 4096);
+            if (max_gen > 32768) max_gen = 32768;
+
+            char request_id[64];
+            snprintf(request_id, sizeof(request_id), "msg_%llu", (unsigned long long)++req_counter);
+            fprintf(stderr, "[serve] %s (anthropic) max_tokens=%d\n", request_id, max_gen);
+
+            // Reset state
+            for (int i = 0; i < NUM_LAYERS; i++) {
+                if (model->layers[i].is_full) {
+                    model->kv_len[i] = 0;
+                } else {
+                    CHECK_CUDA(cudaMemset(model->delta_state[i], 0, delta_sz));
+                    CHECK_CUDA(cudaMemset(model->conv_state[i], 0, conv_sz));
+                }
+            }
+
+            // Build prompt from Anthropic format
+            char *prompt = build_anthropic_prompt(body, "You are a helpful assistant.");
+            uint32_t turn_ids[16384];
+            int turn_ntokens = bpe_encode(tokenizer, prompt, turn_ids, 16384);
+            free(prompt);
+
+            if (turn_ntokens <= 0) {
+                http_write_str(client_fd, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"tokenization failed\"}}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+
+            fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, turn_ntokens);
+
+            // Send SSE headers
+            static const char *ANTH_SSE_HEADERS =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "\r\n";
+            http_write_str(client_fd, ANTH_SSE_HEADERS);
+
+            // message_start
+            anth_send_message_start(client_fd, request_id, "qwen3.5-397b-a17b");
+
+            // Prefill
+            int pos = sys_pos;
+            int next_token = 0;
+            for (int i = 0; i < turn_ntokens; i++)
+                next_token = forward(model, turn_ids[i], pos++, K);
+
+            // Start text content block
+            int block_index = 0;
+            anth_send_content_block_start(client_fd, block_index, "text");
+
+            double t_gen = now_ms();
+            int gen_count = 0;
+            int client_ok = 1;
+            char gen_buffer[65536] = {};
+            int gen_buf_len = 0;
+            int in_tool_call = 0;
+            int tool_call_count = 0;
+            const char *stop_reason = "end_turn";
+
+            // Special tokens to suppress
+            int suppress_tokens[] = { 151643, 151644, 151645, 151646, 151647, 151648,
+                                      151649, 151650, 151651, 151652, 151653, 151654 };
+            int n_suppress = sizeof(suppress_tokens) / sizeof(suppress_tokens[0]);
+
+            for (int gen = 0; gen < max_gen && client_ok; gen++) {
+                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+
+                int is_special = 0;
+                for (int s = 0; s < n_suppress; s++)
+                    if (next_token == suppress_tokens[s]) { is_special = 1; break; }
+                if (is_special) {
+                    gen_count++;
+                    next_token = forward(model, next_token, pos++, K);
+                    continue;
+                }
+
+                char decoded[1024] = {};
+                if (vocab_strings[next_token])
+                    bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
+
+                if (strstr(decoded, "<|im_end|>") || strstr(decoded, "<|endoftext|>")) break;
+
+                // Accumulate for tool call detection
+                if (gen_buf_len + (int)strlen(decoded) < (int)sizeof(gen_buffer) - 1) {
+                    strcpy(gen_buffer + gen_buf_len, decoded);
+                    gen_buf_len += strlen(decoded);
+                }
+
+                if (!in_tool_call && strstr(gen_buffer, "<tool_call>"))
+                    in_tool_call = 1;
+
+                // Stream text content
+                if (!in_tool_call && decoded[0]) {
+                    int is_filtered = (
+                        strstr(decoded, "<|im_start|>") || strstr(decoded, "<|im_end|>") ||
+                        strstr(decoded, "<|endoftext|>") ||
+                        strcmp(decoded, "<think>") == 0 || strcmp(decoded, "</think>") == 0 ||
+                        strcmp(decoded, "user") == 0 || strcmp(decoded, "assistant") == 0 ||
+                        strcmp(decoded, "system") == 0
+                    );
+                    if (!is_filtered) {
+                        if (anth_send_text_delta(client_fd, block_index, decoded) < 0) {
+                            client_ok = 0; break;
+                        }
+                    }
+                }
+
+                // Tool call detected
+                if (in_tool_call && strstr(gen_buffer, "</tool_call>")) {
+                    char func_name[256] = {}, func_args[4096] = {};
+                    if (parse_tool_call(gen_buffer, func_name, sizeof(func_name),
+                                        func_args, sizeof(func_args))) {
+                        // Close text block, open tool_use block
+                        anth_send_content_block_stop(client_fd, block_index);
+                        block_index++;
+
+                        char tool_id[64];
+                        snprintf(tool_id, sizeof(tool_id), "toolu_%d", ++tool_call_count);
+                        anth_send_content_block_start_tool(client_fd, block_index, tool_id, func_name);
+                        anth_send_tool_input_delta(client_fd, block_index, func_args);
+                        anth_send_content_block_stop(client_fd, block_index);
+
+                        fprintf(stderr, "[serve] %s tool_use: %s(%s)\n",
+                                request_id, func_name, func_args);
+                        stop_reason = "tool_use";
+                    }
+                    break;
+                }
+
+                gen_count++;
+                next_token = forward(model, next_token, pos++, K);
+            }
+
+            if (client_ok) {
+                if (tool_call_count == 0)
+                    anth_send_content_block_stop(client_fd, block_index);
+                anth_send_message_delta(client_fd, stop_reason, gen_count);
+                anth_send_message_stop(client_fd);
+            }
+
+            double gen_ms = now_ms() - t_gen;
+            fprintf(stderr, "[serve] %s generated %d tokens in %.0fms (%.2f tok/s)%s\n",
+                    request_id, gen_count, gen_ms,
+                    gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0.0,
+                    tool_call_count > 0 ? " [tool_use]" : "");
 
             free(reqbuf); close(client_fd); continue;
         }
