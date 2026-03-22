@@ -100,6 +100,8 @@ Start the server with `--serve PORT`:
 ./infer --serve 8080
 ```
 
+On startup, the server prefills and caches the system prompt (~4s). All subsequent requests restore from this snapshot instantly — no repeated prefill cost. Custom system prompt can be placed at `~/.flash-moe/system.md`.
+
 ### Endpoints
 
 - `POST /v1/chat/completions` — OpenAI Chat Completions API (SSE streaming)
