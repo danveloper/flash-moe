@@ -2,7 +2,7 @@
 
 CUDA/C port of [Flash-MoE](../CLAUDE.md) for x86 PCs with NVIDIA GPUs. Runs **Qwen3.5-397B-A17B** (397 billion parameter MoE model) on a single RTX 4090 with 24GB VRAM, streaming 209GB of expert weights from NVMe SSD.
 
-**2.45 tokens/second** with production-quality output. No Python. No frameworks. One CUDA file + one kernel header.
+**2.45 tokens/second** with tool calling, OpenAI-compatible API, and SSE streaming. No Python. No frameworks. One CUDA file + one kernel header.
 
 ## How It Works
 
@@ -11,7 +11,7 @@ The full model is 209GB at 4-bit quantization. Only 5.2GB of non-expert weights 
 ```
 SSD (203GB experts) ──GDS──> GPU VRAM (24GB)
                               ↕ CUDA kernels
-CPU RAM (64GB page cache) ←──> GPU compute
+CPU RAM (page cache) ←──────> GPU compute
 ```
 
 Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB each) from SSD. NVIDIA GPUDirect Storage (GDS) enables direct NVMe-to-GPU DMA transfers, bypassing the CPU.
@@ -27,19 +27,19 @@ Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB e
 
 | System | Qwen3.5-397B | Hardware Required | Approach |
 |--------|-------------|-------------------|----------|
-| **Flash-MoE CUDA** | **2.45 tok/s** | **1x RTX 4090 + 64GB RAM + NVMe** | SSD expert streaming, GDS |
+| **Flash-MoE CUDA** | **2.45 tok/s** | **1x RTX 4090 + 16GB+ RAM + NVMe** | SSD expert streaming, GDS |
 | KTransformers | ~14 tok/s* | 1x RTX 4090 + **384GB RAM** | CPU expert compute (AMX), GPU attention |
 | llama.cpp (offload) | ~1-2 tok/s | 1x RTX 4090 + **256GB RAM** | CPU/GPU layer split, GGUF |
 | KTransformers (full) | ~150 tok/s | **4x RTX 4090 + 800GB RAM** | Multi-GPU tensor parallelism |
 
 *KTransformers single-GPU numbers are for Qwen3-235B (smaller model); 397B numbers not published for single GPU.
 
-**Key advantage**: Flash-MoE CUDA requires only **64GB RAM** (vs 256-384GB for alternatives) by streaming experts from SSD instead of storing them in system memory.
+**Key advantage**: Flash-MoE CUDA requires only **16GB RAM** (process uses 5.5GB; more RAM = better page cache but not required) vs 256-384GB for alternatives.
 
 ## Hardware Requirements
 
 - **GPU**: NVIDIA GPU with 16GB+ VRAM (tested on RTX 4090)
-- **RAM**: 64GB+ system memory (for OS page cache)
+- **RAM**: 16GB minimum, 32GB+ recommended (process uses 5.5GB; extra RAM improves page cache hit rate)
 - **SSD**: NVMe SSD with 250GB+ free space, PCIe 4.0+ recommended
 - **CUDA**: 12.8+ with GDS support (optional but recommended)
 - **OS**: Linux (tested on Ubuntu 24.04)
@@ -50,9 +50,7 @@ Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB e
 
 ```bash
 cd cuda_infer
-
-# Requires CUDA toolkit 12.8+ and GDS library
-make
+make      # requires CUDA toolkit 12.8+ and libcufile
 ```
 
 ### 2. Download and prepare model weights
@@ -84,11 +82,143 @@ python3 export_vocab.py model-safetensors/tokenizer.json vocab.bin
 ### 3. Run
 
 ```bash
+# Direct generation
 ./infer --prompt "Explain quantum computing" --tokens 50
+
+# HTTP server (OpenAI-compatible API)
+./infer --serve 8080
 
 # With timing breakdown
 ./infer --prompt "Hello" --tokens 20 --timing
 ```
+
+## HTTP Server (OpenAI-Compatible API)
+
+Start the server with `--serve PORT`:
+
+```bash
+./infer --serve 8080
+```
+
+### Endpoints
+
+- `POST /v1/chat/completions` — Chat completions with SSE streaming
+- `GET /v1/models` — List available models
+- `GET /health` — Health check
+
+### Basic chat
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 100,
+    "stream": true
+  }'
+```
+
+### Tool calling (function calling)
+
+The server supports OpenAI-compatible tool calling. Pass `tools` in the request and the model will generate `tool_calls` in the response:
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    }],
+    "max_tokens": 200,
+    "stream": true
+  }'
+```
+
+Response includes tool calls in OpenAI format:
+
+```json
+{"choices": [{"delta": {"tool_calls": [{"id": "call_1", "type": "function",
+  "function": {"name": "get_weather", "arguments": "{\"location\": \"Tokyo\"}"}}]}}]}
+```
+
+The model correctly generates `<tool_call>` tags which are parsed and converted to OpenAI `tool_calls` format. Generation stops after the tool call so the client can execute the function and send results back.
+
+### Sending tool results back
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "What is the weather in Tokyo?"},
+      {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": "get_weather", "arguments": "{\"location\": \"Tokyo\"}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "call_1",
+       "content": "{\"temperature\": 22, \"condition\": \"sunny\"}"}
+    ],
+    "max_tokens": 200,
+    "stream": true
+  }'
+```
+
+### Using with Claude Code via litellm
+
+Claude Code uses the Anthropic Messages API format, not OpenAI. To bridge them, use [litellm](https://github.com/BerriAI/litellm) as a proxy:
+
+```bash
+# Start the Flash-MoE server
+./infer --serve 9090
+
+# Install and start litellm proxy
+pip install litellm
+litellm --model openai/qwen3.5-397b --api_base http://localhost:9090/v1 --port 4000
+
+# Point Claude Code at litellm
+export ANTHROPIC_BASE_URL=http://localhost:4000
+claude --model qwen3.5-397b
+```
+
+### Using with other OpenAI-compatible clients
+
+The server works directly with any OpenAI-compatible client:
+
+```python
+# Python (openai SDK)
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="qwen3.5-397b",
+    messages=[{"role": "user", "content": "Hello!"}],
+    stream=True
+)
+for chunk in response:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+```bash
+# aider
+aider --model openai/qwen3.5-397b --openai-api-base http://localhost:8080/v1
+
+# continue.dev (VS Code) — add to config.json:
+# {"models": [{"provider": "openai", "model": "qwen3.5-397b",
+#   "apiBase": "http://localhost:8080/v1"}]}
+```
+
+### Custom system prompt
+
+Place a file at `~/.flash-moe/system.md` to override the default system prompt.
 
 ## Architecture
 
@@ -96,8 +226,8 @@ python3 export_vocab.py model-safetensors/tokenizer.json vocab.bin
 
 ```
 cuda_infer/
-  infer.cu         # Complete inference engine (~1200 lines)
-  kernels.cuh      # 15 CUDA compute kernels
+  infer.cu         # Complete inference engine + HTTP server (~1700 lines)
+  kernels.cuh      # 15 CUDA compute kernels (~570 lines)
   Makefile
   build_expert_index.py   # Generate expert_index.json from safetensors
   export_vocab.py         # Generate vocab.bin from tokenizer.json
@@ -168,6 +298,6 @@ For each layer:
 | KV cache (15 full-attn layers) | ~200 MB | GPU VRAM |
 | Delta-net state (45 linear layers) | ~180 MB | GPU VRAM |
 | **Total GPU VRAM** | **~5.8 GB** | |
-| Expert staging (pinned) | ~28 MB | CPU RAM |
-| OS page cache | ~58 GB | CPU RAM (dynamic) |
+| Process RSS | ~5.5 GB | CPU RAM |
+| OS page cache | dynamic | CPU RAM (improves with more RAM) |
 | Expert data on disk | 203 GB | NVMe SSD |
