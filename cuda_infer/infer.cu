@@ -1242,16 +1242,317 @@ static int forward(Model *model, int token_id, int pos, int K) {
 }
 
 // ============================================================================
+// HTTP Server — OpenAI-compatible /v1/chat/completions (SSE streaming)
+// ============================================================================
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <signal.h>
+
+static int read_http_request(int fd, char *buf, int bufsz) {
+    int total = 0;
+    while (total < bufsz - 1) {
+        ssize_t r = read(fd, buf + total, 1);
+        if (r <= 0) return -1;
+        total++;
+        if (total >= 4 && buf[total-4]=='\r' && buf[total-3]=='\n' &&
+            buf[total-2]=='\r' && buf[total-1]=='\n') break;
+    }
+    buf[total] = '\0';
+    // Read body if Content-Length present
+    const char *cl = strcasestr(buf, "Content-Length:");
+    if (cl) {
+        int content_len = atoi(cl + 15);
+        if (content_len > 0 && total + content_len < bufsz - 1) {
+            int got = 0;
+            while (got < content_len) {
+                ssize_t r = read(fd, buf + total + got, content_len - got);
+                if (r <= 0) break;
+                got += r;
+            }
+            total += got;
+            buf[total] = '\0';
+        }
+    }
+    return total;
+}
+
+static void http_write_str(int fd, const char *s) {
+    int len = strlen(s), sent = 0;
+    while (sent < len) {
+        ssize_t w = write(fd, s + sent, len - sent);
+        if (w <= 0) break;
+        sent += w;
+    }
+}
+
+static char *extract_last_content(char *buf) {
+    char *last = NULL, *p = buf;
+    for (;;) {
+        p = strstr(p, "\"content\"");
+        if (!p) break;
+        p += 9;
+        while (*p == ' ' || *p == '\t' || *p == ':') p++;
+        if (*p == '"') { p++; last = p; while (*p && !(*p == '"' && *(p-1) != '\\')) p++; }
+    }
+    if (last) {
+        char *end = last;
+        while (*end && !(*end == '"' && (end == last || *(end-1) != '\\'))) end++;
+        *end = '\0';
+        // Unescape
+        char *r = last, *w = last;
+        while (*r) {
+            if (*r == '\\' && *(r+1)) {
+                r++;
+                switch (*r) {
+                    case 'n': *w++ = '\n'; r++; break;
+                    case 't': *w++ = '\t'; r++; break;
+                    case '"': *w++ = '"'; r++; break;
+                    case '\\': *w++ = '\\'; r++; break;
+                    default: *w++ = '\\'; *w++ = *r++; break;
+                }
+            } else *w++ = *r++;
+        }
+        *w = '\0';
+    }
+    return last;
+}
+
+static int extract_max_tokens(const char *buf, int def) {
+    const char *p = strstr(buf, "\"max_completion_tokens\"");
+    if (!p) p = strstr(buf, "\"max_tokens\"");
+    if (!p) return def;
+    p = strchr(p, ':');
+    return p ? atoi(p + 1) : def;
+}
+
+static int sse_send_delta(int fd, const char *req_id, const char *token_text) {
+    char chunk[4096], escaped[2048];
+    char *w = escaped;
+    for (const char *r = token_text; *r && w < escaped + sizeof(escaped) - 8; r++) {
+        switch (*r) {
+            case '"': *w++ = '\\'; *w++ = '"'; break;
+            case '\\': *w++ = '\\'; *w++ = '\\'; break;
+            case '\n': *w++ = '\\'; *w++ = 'n'; break;
+            case '\r': *w++ = '\\'; *w++ = 'r'; break;
+            case '\t': *w++ = '\\'; *w++ = 't'; break;
+            default: *w++ = *r; break;
+        }
+    }
+    *w = '\0';
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+        req_id, escaped);
+    ssize_t wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
+}
+
+static void sse_send_done(int fd, const char *req_id) {
+    char chunk[1024];
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n", req_id);
+    http_write_str(fd, chunk);
+}
+
+#define EOS_TOKEN_1 151643  // <|endoftext|>
+#define EOS_TOKEN_2 151645  // <|im_end|>
+#define THINK_START 151667  // <think>
+#define THINK_END   151668  // </think>
+
+static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokenizer,
+                       int port, int K) {
+    signal(SIGPIPE, SIG_IGN);
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return; }
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); close(server_fd); return;
+    }
+    if (listen(server_fd, 8) < 0) {
+        perror("listen"); close(server_fd); return;
+    }
+
+    printf("[serve] Listening on http://0.0.0.0:%d\n", port);
+    printf("[serve] Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health\n");
+    fflush(stdout);
+
+    // No system prompt pre-caching for now — each request starts fresh.
+    // (The BPE tokenizer doesn't handle special tokens like <|im_start|> natively;
+    //  proper implementation would use added_tokens from the tokenizer.)
+    int sys_pos = 0;
+    size_t delta_sz = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+    size_t conv_sz = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
+    int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+
+    uint64_t req_counter = 0;
+    fprintf(stderr, "[serve] Ready (no system prompt cache — each request starts fresh)\n");
+
+    static const char *SSE_HEADERS =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n";
+    static const char *CORS_RESPONSE =
+        "HTTP/1.1 204 No Content\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        "Access-Control-Max-Age: 86400\r\n"
+        "\r\n";
+
+    for (;;) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) { perror("accept"); continue; }
+
+        char *reqbuf = (char *)malloc(1024 * 1024);
+        int reqlen = read_http_request(client_fd, reqbuf, 1024 * 1024);
+        if (reqlen <= 0) { free(reqbuf); close(client_fd); continue; }
+
+        char method[16] = {}, path_buf[256] = {};
+        sscanf(reqbuf, "%15s %255s", method, path_buf);
+
+        // CORS preflight
+        if (strcmp(method, "OPTIONS") == 0) {
+            http_write_str(client_fd, CORS_RESPONSE);
+            free(reqbuf); close(client_fd); continue;
+        }
+
+        // GET /health
+        if (strcmp(method, "GET") == 0 && strcmp(path_buf, "/health") == 0) {
+            http_write_str(client_fd,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b-cuda\"}\n");
+            free(reqbuf); close(client_fd); continue;
+        }
+
+        // GET /v1/models
+        if (strcmp(method, "GET") == 0 && strcmp(path_buf, "/v1/models") == 0) {
+            http_write_str(client_fd,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-397b-a17b\","
+                "\"object\":\"model\",\"owned_by\":\"local\"}]}\n");
+            free(reqbuf); close(client_fd); continue;
+        }
+
+        // POST /v1/chat/completions
+        if (strcmp(method, "POST") == 0 && strcmp(path_buf, "/v1/chat/completions") == 0) {
+            char *body = strstr(reqbuf, "\r\n\r\n");
+            if (!body) {
+                http_write_str(client_fd, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\":\"no body\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+            body += 4;
+
+            int max_gen = extract_max_tokens(body, 4096);
+            if (max_gen > 32768) max_gen = 32768;
+
+            char *content = extract_last_content(body);
+            if (!content || !content[0]) {
+                http_write_str(client_fd, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\":\"no content\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+
+            char request_id[64];
+            snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", (unsigned long long)++req_counter);
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d\n",
+                    request_id, strlen(content), max_gen);
+
+            // Reset state for fresh request
+            for (int i = 0; i < NUM_LAYERS; i++) {
+                if (model->layers[i].is_full) {
+                    model->kv_len[i] = 0;
+                } else {
+                    CHECK_CUDA(cudaMemset(model->delta_state[i], 0, delta_sz));
+                    CHECK_CUDA(cudaMemset(model->conv_state[i], 0, conv_sz));
+                }
+            }
+
+            // Tokenize user turn: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+            char *turn = (char *)malloc(strlen(content) + 256);
+            sprintf(turn, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", content);
+            uint32_t turn_ids[4096];
+            int turn_ntokens = bpe_encode(tokenizer, turn, turn_ids, 4096);
+            free(turn);
+
+            fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, turn_ntokens);
+
+            // Send SSE headers
+            http_write_str(client_fd, SSE_HEADERS);
+
+            // Prefill user turn tokens — last forward() return = first generated token
+            int pos = sys_pos;
+            int next_token = 0;
+            for (int i = 0; i < turn_ntokens; i++) {
+                next_token = forward(model, turn_ids[i], pos++, K);
+            }
+
+            double t_gen = now_ms();
+            int gen_count = 0;
+            int client_ok = 1;
+
+            for (int gen = 0; gen < max_gen && client_ok; gen++) {
+                if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+
+                // Decode and send token
+                if (vocab_strings[next_token]) {
+                    char decoded[1024];
+                    bpe_decode_token(vocab_strings[next_token], decoded, sizeof(decoded));
+                    if (sse_send_delta(client_fd, request_id, decoded) < 0) {
+                        client_ok = 0; break;
+                    }
+                }
+                gen_count++;
+
+                // Forward next token
+                next_token = forward(model, next_token, pos++, K);
+            }
+
+            if (client_ok) sse_send_done(client_fd, request_id);
+
+            double gen_ms = now_ms() - t_gen;
+            fprintf(stderr, "[serve] %s generated %d tokens in %.0fms (%.2f tok/s)\n",
+                    request_id, gen_count, gen_ms,
+                    gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0.0);
+
+            free(reqbuf); close(client_fd); continue;
+        }
+
+        // Unknown endpoint
+        http_write_str(client_fd, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n{\"error\":\"not found\"}\n");
+        free(reqbuf); close(client_fd);
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char **argv) {
+    setbuf(stdout, NULL);  // unbuffered stdout for serve mode
     const char *weights_path = "model_weights.bin";
     const char *manifest_path = "model_weights.json";
     const char *vocab_path = "vocab.bin";
     const char *tokenizer_path = "tokenizer.bin";
     const char *expert_dir = "packed_experts";
     const char *prompt_text = NULL;
+    int serve_port = 0;
     int max_tokens = 20;
     int K = 4;
     int timing = 0;
@@ -1265,13 +1566,14 @@ int main(int argc, char **argv) {
         {"prompt",    required_argument, 0, 'P'},
         {"tokens",    required_argument, 0, 't'},
         {"k",         required_argument, 0, 'k'},
+        {"serve",     required_argument, 0, 'S'},
         {"timing",    no_argument,       0, 'M'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:Mh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "w:j:v:T:e:P:t:k:S:Mh", long_options, NULL)) != -1) {
         switch (c) {
             case 'w': weights_path = optarg; break;
             case 'j': manifest_path = optarg; break;
@@ -1281,6 +1583,7 @@ int main(int argc, char **argv) {
             case 'P': prompt_text = optarg; break;
             case 't': max_tokens = atoi(optarg); break;
             case 'k': K = atoi(optarg); break;
+            case 'S': serve_port = atoi(optarg); break;
             case 'M': timing = 1; break;
             case 'h':
                 printf("Usage: %s --prompt TEXT [options]\n", argv[0]);
@@ -1292,17 +1595,17 @@ int main(int argc, char **argv) {
                 printf("  --prompt TEXT    input prompt\n");
                 printf("  --tokens N       max tokens (default: 20)\n");
                 printf("  --k N            active experts (default: 4)\n");
+                printf("  --serve PORT     HTTP server (OpenAI-compatible API)\n");
                 printf("  --timing         per-layer timing\n");
                 return 0;
             default: return 1;
         }
     }
 
-    if (!prompt_text) {
-        fprintf(stderr, "Error: --prompt required\n");
+    if (!prompt_text && serve_port == 0) {
+        fprintf(stderr, "Error: --prompt or --serve required\n");
         return 1;
     }
-
     // Initialize CUDA
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
@@ -1341,6 +1644,18 @@ int main(int argc, char **argv) {
     }
     printf("[tokenizer] Loaded (%d vocab, %d merges)\n", tokenizer.vocab_size, tokenizer.num_merges);
 
+    // Initialize model
+    Model *model = model_init(wf, expert_dir, K);
+    if (!model) return 1;
+
+    // Serve mode
+    if (serve_port > 0) {
+        serve_loop(model, vocab_strings, &tokenizer, serve_port, K);
+        return 0;
+    }
+
+    if (!prompt_text) { fprintf(stderr, "Error: --prompt required\n"); return 1; }
+
     // Tokenize prompt
     uint32_t token_ids_buf[4096];
     int num_tokens = bpe_encode(&tokenizer, prompt_text, token_ids_buf, 4096);
@@ -1349,10 +1664,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < num_tokens && i < 20; i++) printf(" %u", token_ids_buf[i]);
     if (num_tokens > 20) printf(" ...");
     printf("\n");
-
-    // Initialize model
-    Model *model = model_init(wf, expert_dir, K);
-    if (!model) return 1;
 
     printf("\n[generating] %d tokens, K=%d experts\n", max_tokens, K);
     double gen_start = now_ms();
