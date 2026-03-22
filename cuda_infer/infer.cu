@@ -1318,6 +1318,22 @@ static char *extract_last_content(char *buf) {
     return last;
 }
 
+// Extract a string value for a given key from JSON body. Returns 0 if not found.
+static int extract_string_field(const char *buf, const char *key, char *out, int out_sz) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(buf, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '"') return 0;
+    p++;
+    int i = 0;
+    while (*p && *p != '"' && i < out_sz - 1) out[i++] = *p++;
+    out[i] = '\0';
+    return i > 0;
+}
+
 static int extract_max_tokens(const char *buf, int def) {
     const char *p = strstr(buf, "\"max_completion_tokens\"");
     if (!p) p = strstr(buf, "\"max_tokens\"");
@@ -1967,6 +1983,11 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
     fprintf(stderr, "[serve] State snapshot saved (%d layers)\n", NUM_LAYERS);
 
     uint64_t req_counter = 0;
+
+    // Session tracking — keep KV cache across requests in the same session
+    char active_session[128] = {};
+    int session_pos = 0;  // RoPE position after last generation
+
     fprintf(stderr, "[serve] Ready\n");
 
     static const char *SSE_HEADERS =
@@ -2034,30 +2055,51 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int max_gen = extract_max_tokens(body, 4096);
             if (max_gen > 32768) max_gen = 32768;
 
-            // Extract tools if present
+            // Extract tools and session_id
             char *tools_json = extract_tools_json(body);
+            char req_session[128] = {};
+            extract_string_field(body, "session_id", req_session, sizeof(req_session));
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", (unsigned long long)++req_counter);
-            fprintf(stderr, "[serve] %s max_tokens=%d tools=%s\n",
-                    request_id, max_gen, tools_json ? "yes" : "no");
 
-            // Restore state from system prompt snapshot
-            for (int i = 0; i < NUM_LAYERS; i++) {
-                if (model->layers[i].is_full) {
-                    size_t sz = snap_kv_len[i] * kv_dim * sizeof(float);
-                    if (sz > 0) {
-                        CHECK_CUDA(cudaMemcpy(model->kv_k[i], snap_kv_k[i], sz, cudaMemcpyHostToDevice));
-                        CHECK_CUDA(cudaMemcpy(model->kv_v[i], snap_kv_v[i], sz, cudaMemcpyHostToDevice));
+            // Determine if this is a continuation of the active session
+            int is_continuation = (req_session[0] && active_session[0] &&
+                                   strcmp(req_session, active_session) == 0);
+
+            fprintf(stderr, "[serve] %s max_tokens=%d tools=%s session=%s%s\n",
+                    request_id, max_gen, tools_json ? "yes" : "no",
+                    req_session[0] ? req_session : "(none)",
+                    is_continuation ? " [CONTINUE]" : " [NEW]");
+
+            int pos;
+            if (is_continuation) {
+                // Continue from existing state — no restore needed
+                pos = session_pos;
+            } else {
+                // New session — restore from system prompt snapshot
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    if (model->layers[i].is_full) {
+                        size_t sz = snap_kv_len[i] * kv_dim * sizeof(float);
+                        if (sz > 0) {
+                            CHECK_CUDA(cudaMemcpy(model->kv_k[i], snap_kv_k[i], sz, cudaMemcpyHostToDevice));
+                            CHECK_CUDA(cudaMemcpy(model->kv_v[i], snap_kv_v[i], sz, cudaMemcpyHostToDevice));
+                        }
+                        model->kv_len[i] = snap_kv_len[i];
+                    } else {
+                        CHECK_CUDA(cudaMemcpy(model->delta_state[i], snap_delta[i], delta_sz, cudaMemcpyHostToDevice));
+                        CHECK_CUDA(cudaMemcpy(model->conv_state[i], snap_conv[i], conv_sz, cudaMemcpyHostToDevice));
                     }
-                    model->kv_len[i] = snap_kv_len[i];
+                }
+                pos = sys_pos;
+                if (req_session[0]) {
+                    strncpy(active_session, req_session, sizeof(active_session) - 1);
                 } else {
-                    CHECK_CUDA(cudaMemcpy(model->delta_state[i], snap_delta[i], delta_sz, cudaMemcpyHostToDevice));
-                    CHECK_CUDA(cudaMemcpy(model->conv_state[i], snap_conv[i], conv_sz, cudaMemcpyHostToDevice));
+                    active_session[0] = '\0';
                 }
             }
 
-            // Build full ChatML prompt from messages + tools
+            // Build per-request prompt (user turn + tools only, system prompt already cached)
             char *prompt = build_chat_prompt(body, tools_json);
             if (tools_json) free(tools_json);
 
@@ -2070,13 +2112,12 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, turn_ntokens);
+            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos);
 
             // Send SSE headers
             http_write_str(client_fd, SSE_HEADERS);
 
             // Prefill user turn tokens — last forward() return = first generated token
-            int pos = sys_pos;
             int next_token = 0;
             for (int i = 0; i < turn_ntokens; i++) {
                 next_token = forward(model, turn_ids[i], pos++, K);
@@ -2186,11 +2227,14 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 }
             }
 
+            // Save session position for continuation
+            session_pos = pos;
+
             double gen_ms = now_ms() - t_gen;
-            fprintf(stderr, "[serve] %s generated %d tokens in %.0fms (%.2f tok/s)%s\n",
+            fprintf(stderr, "[serve] %s generated %d tokens in %.0fms (%.2f tok/s)%s pos=%d\n",
                     request_id, gen_count, gen_ms,
                     gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0.0,
-                    tool_call_count > 0 ? " [tool_calls]" : "");
+                    tool_call_count > 0 ? " [tool_calls]" : "", pos);
 
             free(reqbuf); close(client_fd); continue;
         }
@@ -2207,21 +2251,54 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int max_gen = extract_max_tokens(body, 4096);
             if (max_gen > 32768) max_gen = 32768;
 
-            char request_id[64];
-            snprintf(request_id, sizeof(request_id), "msg_%llu", (unsigned long long)++req_counter);
-            fprintf(stderr, "[serve] %s (anthropic) max_tokens=%d\n", request_id, max_gen);
-
-            // Reset state
-            for (int i = 0; i < NUM_LAYERS; i++) {
-                if (model->layers[i].is_full) {
-                    model->kv_len[i] = 0;
-                } else {
-                    CHECK_CUDA(cudaMemset(model->delta_state[i], 0, delta_sz));
-                    CHECK_CUDA(cudaMemset(model->conv_state[i], 0, conv_sz));
+            char req_session[128] = {};
+            extract_string_field(body, "session_id", req_session, sizeof(req_session));
+            // Also check x-session-id header for Anthropic clients
+            if (!req_session[0]) {
+                const char *hdr = strcasestr(reqbuf, "x-session-id:");
+                if (hdr) { hdr += 13; while (*hdr == ' ') hdr++;
+                    int i = 0; while (*hdr && *hdr != '\r' && *hdr != '\n' && i < 127) req_session[i++] = *hdr++;
+                    req_session[i] = '\0';
                 }
             }
 
-            // Build prompt from Anthropic format
+            char request_id[64];
+            snprintf(request_id, sizeof(request_id), "msg_%llu", (unsigned long long)++req_counter);
+
+            int is_continuation = (req_session[0] && active_session[0] &&
+                                   strcmp(req_session, active_session) == 0);
+
+            fprintf(stderr, "[serve] %s (anthropic) max_tokens=%d session=%s%s\n",
+                    request_id, max_gen,
+                    req_session[0] ? req_session : "(none)",
+                    is_continuation ? " [CONTINUE]" : " [NEW]");
+
+            int pos;
+            if (is_continuation) {
+                pos = session_pos;
+            } else {
+                // Restore from system prompt snapshot
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    if (model->layers[i].is_full) {
+                        size_t sz = snap_kv_len[i] * kv_dim * sizeof(float);
+                        if (sz > 0) {
+                            CHECK_CUDA(cudaMemcpy(model->kv_k[i], snap_kv_k[i], sz, cudaMemcpyHostToDevice));
+                            CHECK_CUDA(cudaMemcpy(model->kv_v[i], snap_kv_v[i], sz, cudaMemcpyHostToDevice));
+                        }
+                        model->kv_len[i] = snap_kv_len[i];
+                    } else {
+                        CHECK_CUDA(cudaMemcpy(model->delta_state[i], snap_delta[i], delta_sz, cudaMemcpyHostToDevice));
+                        CHECK_CUDA(cudaMemcpy(model->conv_state[i], snap_conv[i], conv_sz, cudaMemcpyHostToDevice));
+                    }
+                }
+                pos = sys_pos;
+                if (req_session[0])
+                    strncpy(active_session, req_session, sizeof(active_session) - 1);
+                else
+                    active_session[0] = '\0';
+            }
+
+            // Build prompt from Anthropic format (user turn only, system prompt cached)
             char *prompt = build_anthropic_prompt(body, "You are a helpful assistant.");
             uint32_t turn_ids[16384];
             int turn_ntokens = bpe_encode(tokenizer, prompt, turn_ids, 16384);
@@ -2232,7 +2309,7 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, turn_ntokens);
+            fprintf(stderr, "[serve] %s prompt=%d tokens, pos=%d\n", request_id, turn_ntokens, pos);
 
             // Send SSE headers
             static const char *ANTH_SSE_HEADERS =
@@ -2248,7 +2325,6 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             anth_send_message_start(client_fd, request_id, "qwen3.5-397b-a17b");
 
             // Prefill
-            int pos = sys_pos;
             int next_token = 0;
             for (int i = 0; i < turn_ntokens; i++)
                 next_token = forward(model, turn_ids[i], pos++, K);
@@ -2347,11 +2423,14 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 anth_send_message_stop(client_fd);
             }
 
+            // Save session position
+            session_pos = pos;
+
             double gen_ms = now_ms() - t_gen;
-            fprintf(stderr, "[serve] %s generated %d tokens in %.0fms (%.2f tok/s)%s\n",
+            fprintf(stderr, "[serve] %s generated %d tokens in %.0fms (%.2f tok/s)%s pos=%d\n",
                     request_id, gen_count, gen_ms,
                     gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0.0,
-                    tool_call_count > 0 ? " [tool_use]" : "");
+                    tool_call_count > 0 ? " [tool_use]" : "", pos);
 
             free(reqbuf); close(client_fd); continue;
         }
