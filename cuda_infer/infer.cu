@@ -518,6 +518,18 @@ typedef struct {
     void *d_weights;  // single allocation for all non-expert weights
     size_t d_weights_size;
 
+    // ---- VRAM expert cache ----
+    // LRU cache of recently-used experts in GPU memory.
+    // Avoids SSD reads for hot experts (~95% hit rate with 18GB).
+    void *vram_cache_pool;          // [vram_cache_capacity * EXPERT_SIZE] GPU memory
+    int vram_cache_capacity;        // max experts that fit
+    int vram_cache_used;            // current fill level
+    uint64_t vram_cache_clock;      // LRU clock (increments per access)
+    // Direct-mapped lookup: cache_map[layer][expert] = slot index (-1 = not cached)
+    int cache_map[NUM_LAYERS][NUM_EXPERTS];
+    // Per-slot metadata
+    struct { int layer; int expert_id; uint64_t last_used; } *cache_slots;
+
 } Model;
 
 // ============================================================================
@@ -764,13 +776,47 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
         printf("[init] Using pread + page cache (set ENABLE_GDS=1 to force GDS)\n");
     }
 
+    // ---- VRAM expert cache ----
+    // Use most of remaining VRAM for caching hot experts.
+    // Reserve 512MB for safety, use the rest.
+    // Set DISABLE_VRAM_CACHE=1 to disable.
+    {
+        int skip_cache = (getenv("DISABLE_VRAM_CACHE") != NULL);
+        size_t free_mem, total_mem;
+        CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
+        size_t reserve = 512ULL * 1024 * 1024;  // keep 512MB free
+        size_t cache_bytes = (free_mem > reserve && !skip_cache) ? free_mem - reserve : 0;
+        model->vram_cache_capacity = (int)(cache_bytes / EXPERT_SIZE);
+        if (model->vram_cache_capacity > 0) {
+            size_t alloc = (size_t)model->vram_cache_capacity * EXPERT_SIZE;
+            CHECK_CUDA(cudaMalloc(&model->vram_cache_pool, alloc));
+            model->cache_slots = (decltype(model->cache_slots))calloc(
+                model->vram_cache_capacity, sizeof(model->cache_slots[0]));
+            for (int i = 0; i < model->vram_cache_capacity; i++) {
+                model->cache_slots[i].layer = -1;
+                model->cache_slots[i].expert_id = -1;
+            }
+            memset(model->cache_map, -1, sizeof(model->cache_map));
+            model->vram_cache_used = 0;
+            model->vram_cache_clock = 0;
+            printf("[init] VRAM expert cache: %d experts (%.1f GB), %.1f%% of total\n",
+                   model->vram_cache_capacity,
+                   alloc / (1024.0*1024*1024),
+                   100.0 * model->vram_cache_capacity / (NUM_LAYERS * NUM_EXPERTS));
+        } else {
+            printf("[init] VRAM expert cache: disabled%s\n", skip_cache ? " by env" : " (not enough VRAM)");
+        }
+    }
+
     // Print GPU memory usage
-    size_t free_mem, total_mem;
-    CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
-    printf("[init] GPU memory: %.2f GB used, %.2f GB free / %.2f GB total\n",
-           (total_mem - free_mem) / (1024.0*1024*1024),
-           free_mem / (1024.0*1024*1024),
-           total_mem / (1024.0*1024*1024));
+    {
+        size_t free_mem, total_mem;
+        CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
+        printf("[init] GPU memory: %.2f GB used, %.2f GB free / %.2f GB total\n",
+               (total_mem - free_mem) / (1024.0*1024*1024),
+               free_mem / (1024.0*1024*1024),
+               total_mem / (1024.0*1024*1024));
+    }
 
     return model;
 }
@@ -1209,15 +1255,123 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.shared_expert += t1-t0; t0=t1; }
 
-    // 6. Load K experts from SSD (overlaps with shared expert GPU work above)
-    load_experts(model, layer_idx, expert_ids, K);
+    // 6. Load K experts — check VRAM cache first, then SSD
+    // expert_ptrs[k] points to expert data in VRAM (cache or freshly loaded)
+    void *expert_ptrs[MAX_K];
+    {
+        int need_ssd[MAX_K];  // indices of experts that need SSD load
+        int need_ssd_ids[MAX_K];
+        int n_ssd = 0;
+
+        model->vram_cache_clock++;
+
+        for (int k = 0; k < K; k++) {
+            int eid = expert_ids[k];
+            int slot = model->cache_map[layer_idx][eid];
+            if (slot >= 0 && model->cache_slots[slot].layer == layer_idx &&
+                model->cache_slots[slot].expert_id == eid) {
+                // Cache hit — point directly at VRAM cache slot
+                expert_ptrs[k] = (char *)model->vram_cache_pool + (size_t)slot * EXPERT_SIZE;
+                model->cache_slots[slot].last_used = model->vram_cache_clock;
+            } else {
+                // Cache miss — need SSD load
+                need_ssd[n_ssd] = k;
+                need_ssd_ids[n_ssd] = eid;
+                n_ssd++;
+            }
+        }
+
+        if (n_ssd > 0) {
+            // Load missing experts from SSD
+            pthread_t threads[MAX_K];
+            PreadArg args[MAX_K];
+            int fd = model->expert_fds[layer_idx];
+            for (int i = 0; i < n_ssd; i++) {
+                args[i].fd = fd;
+                args[i].buf = model->h_expert_buf[i];
+                args[i].size = EXPERT_SIZE;
+                args[i].offset = (off_t)need_ssd_ids[i] * EXPERT_SIZE;
+                pthread_create(&threads[i], NULL, pread_worker, &args[i]);
+            }
+            for (int i = 0; i < n_ssd; i++)
+                pthread_join(threads[i], NULL);
+
+            // Copy to VRAM cache slots (or buf_expert_data if cache full)
+            for (int i = 0; i < n_ssd; i++) {
+                int k = need_ssd[i];
+                int eid = need_ssd_ids[i];
+                int slot = -1;
+
+                if (model->vram_cache_used < model->vram_cache_capacity) {
+                    // Free slot available
+                    slot = model->vram_cache_used++;
+                } else if (model->vram_cache_capacity > 0) {
+                    // Evict LRU
+                    uint64_t min_used = UINT64_MAX;
+                    int min_slot = 0;
+                    for (int s = 0; s < model->vram_cache_capacity; s++) {
+                        if (model->cache_slots[s].last_used < min_used) {
+                            min_used = model->cache_slots[s].last_used;
+                            min_slot = s;
+                        }
+                    }
+                    slot = min_slot;
+                    // Remove old entry from cache_map
+                    if (model->cache_slots[slot].layer >= 0)
+                        model->cache_map[model->cache_slots[slot].layer]
+                                        [model->cache_slots[slot].expert_id] = -1;
+                }
+
+                if (slot >= 0) {
+                    void *dst = (char *)model->vram_cache_pool + (size_t)slot * EXPERT_SIZE;
+                    // Copy to temp buffer first (for immediate use), then async to cache
+                    void *tmp = (char *)model->buf_expert_data + k * EXPERT_SIZE;
+                    CHECK_CUDA(cudaMemcpy(tmp, model->h_expert_buf[i], EXPERT_SIZE,
+                                          cudaMemcpyHostToDevice));
+                    // Async copy to cache slot (runs in background)
+                    CHECK_CUDA(cudaMemcpyAsync(dst, tmp, EXPERT_SIZE,
+                                               cudaMemcpyDeviceToDevice, model->stream_transfer));
+                    model->cache_slots[slot].layer = layer_idx;
+                    model->cache_slots[slot].expert_id = eid;
+                    model->cache_slots[slot].last_used = model->vram_cache_clock;
+                    model->cache_map[layer_idx][eid] = slot;
+                    expert_ptrs[k] = tmp;  // use temp buffer now, cache fills in background
+                } else {
+                    // No cache — use temporary buffer
+                    CHECK_CUDA(cudaMemcpy(
+                        (char *)model->buf_expert_data + k * EXPERT_SIZE,
+                        model->h_expert_buf[i], EXPERT_SIZE, cudaMemcpyHostToDevice));
+                    expert_ptrs[k] = (char *)model->buf_expert_data + k * EXPERT_SIZE;
+                }
+            }
+        }
+    }
 
     if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.expert_io += t1-t0; t0=t1; }
 
-    // 7. Expert forward (K experts on GPU)
+    // 7. Expert forward (K experts on GPU, using cached pointers)
     for (int k = 0; k < K; k++) {
-        expert_forward(model, k, model->buf_normed,
-                       model->buf_expert_outs + k * HIDDEN_DIM);
+        // expert_forward from arbitrary VRAM location
+        void *base = expert_ptrs[k];
+
+        uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);
+        uint16_t *gate_s = (uint16_t *)((char *)base + EXP_GATE_S);
+        uint16_t *gate_b = (uint16_t *)((char *)base + EXP_GATE_B);
+        uint32_t *up_w   = (uint32_t *)((char *)base + EXP_UP_W);
+        uint16_t *up_s   = (uint16_t *)((char *)base + EXP_UP_S);
+        uint16_t *up_b   = (uint16_t *)((char *)base + EXP_UP_B);
+        uint32_t *down_w = (uint32_t *)((char *)base + EXP_DOWN_W);
+        uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
+        uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
+
+        launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
+                              model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+        launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
+                              model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+        launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                      MOE_INTERMEDIATE);
+        launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
+                              model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
     }
 
     // 8. MoE combine + residual (no per-layer malloc)

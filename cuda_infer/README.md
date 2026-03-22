@@ -2,32 +2,40 @@
 
 CUDA/C port of [Flash-MoE](../CLAUDE.md) for x86 PCs with NVIDIA GPUs. Runs **Qwen3.5-397B-A17B** (397 billion parameter MoE model) on a single RTX 4090 with 24GB VRAM, streaming 209GB of expert weights from NVMe SSD.
 
-**2.45 tokens/second** with tool calling, OpenAI-compatible API, and SSE streaming. No Python. No frameworks. One CUDA file + one kernel header.
+**3.55 tokens/second** (warm cache) with tool calling, OpenAI-compatible API, and SSE streaming. No Python. No frameworks. One CUDA file + one kernel header.
 
 ## How It Works
 
 The full model is 209GB at 4-bit quantization. Only 5.2GB of non-expert weights fit in GPU VRAM. The remaining 203GB of expert weights (512 experts per layer, K=4 activated per token) stream from NVMe SSD on demand:
 
 ```
-SSD (203GB experts) ──GDS──> GPU VRAM (24GB)
-                              ↕ CUDA kernels
-CPU RAM (page cache) ←──────> GPU compute
+SSD (203GB experts) ──pread──> CPU RAM (page cache) ──cudaMemcpy──> GPU VRAM
+                                                                     ↕
+                                               VRAM expert cache (17GB, ~2500 experts)
+                                                                     ↕
+                                                               CUDA kernels
 ```
 
-Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB each) from SSD. The OS page cache (using available system RAM) automatically caches frequently-accessed experts — with 64GB RAM, roughly half the expert data stays in cache after warm-up, cutting average I/O time from 5.8ms to ~3ms per layer. GDS (direct NVMe-to-GPU DMA) is available as an option for low-RAM systems via `ENABLE_GDS=1`.
+Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB each). A three-tier caching hierarchy minimizes SSD access:
+
+1. **VRAM expert cache** (~17GB, ~2500 experts): LRU cache in GPU memory. Hot experts are served instantly without any I/O. After a few requests, ~95% of expert accesses hit the VRAM cache.
+2. **OS page cache** (~50GB with 64GB RAM): Experts not in VRAM are read via `pread()`, which populates the OS page cache. Repeat accesses hit RAM at ~10 GB/s.
+3. **NVMe SSD**: Cold misses go to SSD at ~5-7 GB/s.
+
+The VRAM cache warms progressively: 2.49 tok/s cold → 3.22 after one request → **3.55 tok/s** after a few requests. GDS (direct NVMe-to-GPU DMA) is available for low-RAM systems via `ENABLE_GDS=1` but bypasses the page cache, so it's slower for sustained generation.
 
 ## Results
 
 | Configuration | tok/s | Hardware | Notes |
 |--------------|-------|----------|-------|
-| **Flash-MoE CUDA** | **2.52** | 1x RTX 4090, 64GB RAM, 2TB NVMe | This project. Page cache + SSD streaming. |
+| **Flash-MoE CUDA** | **3.55** | 1x RTX 4090, 64GB RAM, 2TB NVMe | This project. VRAM cache + page cache + SSD. |
 | Flash-MoE Metal (Apple) | 4.36 | M3 Max 48GB, 1TB NVMe | Original project. Unified memory. |
 
 ### Comparison with Other Solutions
 
 | System | Qwen3.5-397B | Hardware Required | Approach |
 |--------|-------------|-------------------|----------|
-| **Flash-MoE CUDA** | **2.52 tok/s** | **1x RTX 4090 + 16GB+ RAM + NVMe** | SSD streaming + page cache |
+| **Flash-MoE CUDA** | **3.55 tok/s** | **1x RTX 4090 + 16GB+ RAM + NVMe** | VRAM cache + page cache + SSD |
 | KTransformers | ~14 tok/s* | 1x RTX 4090 + **384GB RAM** | CPU expert compute (AMX), GPU attention |
 | llama.cpp (offload) | ~1-2 tok/s | 1x RTX 4090 + **256GB RAM** | CPU/GPU layer split, GGUF |
 | KTransformers (full) | ~150 tok/s | **4x RTX 4090 + 800GB RAM** | Multi-GPU tensor parallelism |
@@ -297,10 +305,11 @@ For each layer:
 | Component | Size | Location |
 |-----------|------|----------|
 | Non-expert weights | 5.2 GB | GPU VRAM |
+| **VRAM expert cache** | **~17 GB** | **GPU VRAM (LRU, ~2500 experts)** |
 | Scratch buffers | ~200 MB | GPU VRAM |
 | KV cache (15 full-attn layers) | ~200 MB | GPU VRAM |
 | Delta-net state (45 linear layers) | ~180 MB | GPU VRAM |
-| **Total GPU VRAM** | **~5.8 GB** | |
+| **Total GPU VRAM** | **~23 GB** | |
 | Process RSS | ~5.5 GB | CPU RAM |
-| OS page cache | dynamic | CPU RAM (improves with more RAM) |
+| OS page cache | ~50 GB | CPU RAM (dynamic, caches SSD reads) |
 | Expert data on disk | 203 GB | NVMe SSD |
