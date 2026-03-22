@@ -1782,8 +1782,39 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
             int in_tool_call = 0;
             int tool_call_count = 0;
 
+            // Special token IDs to suppress from output
+            // These are Qwen3.5 special token IDs that should not appear as content
+            int suppress_tokens[] = {
+                151643, // <|endoftext|>
+                151644, // <|im_start|>
+                151645, // <|im_end|>
+                151646, // <|object_ref_start|>
+                151647, // <|object_ref_end|>
+                151648, // <|quad_start|>
+                151649, // <|quad_end|>
+                151650, // <|vision_start|>
+                151651, // <|vision_end|>
+                151652, // <|vision_pad|>
+                151653, // <|image_pad|>
+                151654, // <|video_pad|>
+            };
+            int n_suppress = sizeof(suppress_tokens) / sizeof(suppress_tokens[0]);
+
             for (int gen = 0; gen < max_gen && client_ok; gen++) {
+                // Stop on EOS tokens
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) break;
+
+                // Check if this is a suppressed special token
+                int is_special = 0;
+                for (int s = 0; s < n_suppress; s++) {
+                    if (next_token == suppress_tokens[s]) { is_special = 1; break; }
+                }
+                if (is_special) {
+                    // Special token — don't output, just continue generating
+                    gen_count++;
+                    next_token = forward(model, next_token, pos++, K);
+                    continue;
+                }
 
                 // Decode token
                 char decoded[1024] = {};
@@ -1799,10 +1830,27 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                 // Check for tool call start
                 if (!in_tool_call && strstr(gen_buffer, "<tool_call>")) {
                     in_tool_call = 1;
+                    // Flush any content before <tool_call> that was already sent
+                    // (the "<tool_call>" text itself was accumulated but not sent)
                 }
 
-                // If not in a tool call, stream content normally
-                if (!in_tool_call && decoded[0]) {
+                // Stop if decoded text contains EOS markers
+                if (strstr(decoded, "<|im_end|>") || strstr(decoded, "<|endoftext|>")) break;
+
+                // Filter special text patterns from content
+                int is_filtered = (
+                    strstr(decoded, "<|im_start|>") ||
+                    strstr(decoded, "<|im_end|>") ||
+                    strstr(decoded, "<|endoftext|>") ||
+                    strcmp(decoded, "<think>") == 0 ||
+                    strcmp(decoded, "</think>") == 0 ||
+                    strcmp(decoded, "user") == 0 ||     // stray role tokens
+                    strcmp(decoded, "assistant") == 0 || // stray role tokens
+                    strcmp(decoded, "system") == 0       // stray role tokens
+                );
+
+                // If not in a tool call and not filtered, stream content
+                if (!in_tool_call && decoded[0] && !is_filtered) {
                     if (sse_send_delta(client_fd, request_id, decoded) < 0) {
                         client_ok = 0; break;
                     }
@@ -1820,10 +1868,9 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
                         fprintf(stderr, "[serve] %s tool_call: %s(%s)\n",
                                 request_id, func_name, func_args);
                     }
-                    in_tool_call = 0;
-                    // Reset buffer after tool call
-                    gen_buf_len = 0;
-                    gen_buffer[0] = '\0';
+                    // Stop generation after tool call — the client needs to
+                    // execute the tool and send results back in a new request
+                    break;
                 }
 
                 gen_count++;
