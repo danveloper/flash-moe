@@ -727,9 +727,14 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
         }
     }
 
-    // Initialize GDS
+    // GDS vs page cache: pread with page cache is faster for sustained generation
+    // because hot experts stay in RAM (~3ms vs 5.3ms). GDS bypasses page cache.
+    // Use --gds flag or ENABLE_GDS=1 env var to force GDS (useful if RAM < 32GB).
     model->gds_available = 0;
-    CUfileError_t gds_status = cuFileDriverOpen();
+    int want_gds = (getenv("ENABLE_GDS") != NULL);
+    CUfileError_t gds_status;
+    if (!want_gds) { gds_status.err = (CUfileOpError)999; }
+    else { gds_status = cuFileDriverOpen(); }
     if (gds_status.err == CU_FILE_SUCCESS) {
         int gds_ok = 1;
         for (int i = 0; i < NUM_LAYERS; i++) {
@@ -750,13 +755,13 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
             // Register expert data buffer for GDS
             cuFileBufRegister(model->buf_expert_data, MAX_K * EXPERT_SIZE, 0);
             model->gds_available = 1;
-            printf("[init] GDS: enabled (direct SSD→GPU transfers)\n");
+            printf("[init] GDS: enabled (direct SSD→GPU, set ENABLE_GDS=1)\n");
         } else {
-            printf("[init] GDS: not available, using pread+cudaMemcpy\n");
+            printf("[init] Using pread + page cache (best for 32GB+ RAM)\n");
             cuFileDriverClose();
         }
     } else {
-        printf("[init] GDS: driver not available\n");
+        printf("[init] Using pread + page cache (set ENABLE_GDS=1 to force GDS)\n");
     }
 
     // Print GPU memory usage
