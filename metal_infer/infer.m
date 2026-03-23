@@ -225,7 +225,6 @@ static int g_think_budget = 2048; // max thinking tokens before force-emitting <
 // ============================================================================
 
 static int g_cache_aware_enabled = 0;       // enabled by --cache-aware flag
-static float g_cache_bonus = 0.5f;          // (reserved) additive bonus for future scoring experiments
 static float g_cache_tolerance = 0.10f;     // max score degradation as fraction of top-K range
 static int g_cache_aware_window = 25;       // tokens within which an expert is "likely cached"
 
@@ -898,6 +897,7 @@ static void cpu_topk_cache_aware(
     int *indices, float *values,
     int layer_idx
 ) {
+    if (K > MAX_K) K = MAX_K;  // clamp to prevent stack overflow
     // Step 1: Standard top-K
     cpu_topk(scores, dim, K, indices, values);
 
@@ -931,8 +931,13 @@ static void cpu_topk_cache_aware(
         if (values[k] < min_topk_score) min_topk_score = values[k];
     }
     float score_range = max_topk_score - min_topk_score;
-    if (score_range < 1e-6f) score_range = 1e-6f;  // avoid zero range
-    float abs_tolerance = g_cache_tolerance * score_range;
+    float abs_tolerance;
+    if (score_range < 1e-6f) {
+        // K=1 or tied scores: use absolute tolerance based on max score magnitude
+        abs_tolerance = g_cache_tolerance * (fabsf(max_topk_score) + 1e-6f);
+    } else {
+        abs_tolerance = g_cache_tolerance * score_range;
+    }
 
     // Global floor: no substitute below this score
     float global_floor = min_topk_score - abs_tolerance;
@@ -1024,8 +1029,8 @@ static void car_print_stats(void) {
             total > 0 ? 100.0 * (g_car_estimated_hits - g_car_substitutions) / total : 0.0,
             total > 0 ? 100.0 * g_car_estimated_hits / total : 0.0,
             total > 0 ? 100.0 * g_car_substitutions / total : 0.0);
-    fprintf(stderr, "Config:          bonus=%.2f, tolerance=%.2f, window=%d\n",
-            g_cache_bonus, g_cache_tolerance, g_cache_aware_window);
+    fprintf(stderr, "Config:          tolerance=%.2f, window=%d\n",
+            g_cache_tolerance, g_cache_aware_window);
 }
 
 // Element-wise add: dst += src
@@ -6560,7 +6565,8 @@ static void serve_loop(
                 }
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
-            if (g_cache_aware_enabled) cache_aware_reset();
+            // NOTE: Do NOT reset cache-aware state between serve requests.
+            // The OS page cache persists across requests, so our tracking should too.
 
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
@@ -6776,7 +6782,6 @@ static void print_usage(const char *prog) {
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --cache-aware        Enable cache-aware routing (prefer cached experts)\n");
-    printf("  --cache-bonus F      Cache-aware bonus on raw logits (default: 0.5)\n");
     printf("  --cache-tolerance F  Max relative score degradation (default: 0.10 = 10%%)\n");
     printf("  --cache-window N     Tokens within which expert is 'likely cached' (default: 25)\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
@@ -6803,7 +6808,7 @@ int main(int argc, char **argv) {
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
         // Long-option-only codes (above 256 to avoid single-char conflicts)
-        enum { OPT_CACHE_AWARE = 300, OPT_CACHE_BONUS, OPT_CACHE_TOLERANCE, OPT_CACHE_WINDOW };
+        enum { OPT_CACHE_AWARE = 300, OPT_CACHE_TOLERANCE, OPT_CACHE_WINDOW };
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -6828,7 +6833,6 @@ int main(int argc, char **argv) {
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
             {"cache-aware",     no_argument,       0, OPT_CACHE_AWARE},
-            {"cache-bonus",     required_argument, 0, OPT_CACHE_BONUS},
             {"cache-tolerance", required_argument, 0, OPT_CACHE_TOLERANCE},
             {"cache-window",    required_argument, 0, OPT_CACHE_WINDOW},
             {"help",          no_argument,       0, 'h'},
@@ -6866,7 +6870,6 @@ int main(int argc, char **argv) {
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
                 case OPT_CACHE_AWARE:     g_cache_aware_enabled = 1; break;
-                case OPT_CACHE_BONUS:     g_cache_bonus = atof(optarg); break;
                 case OPT_CACHE_TOLERANCE: g_cache_tolerance = atof(optarg); break;
                 case OPT_CACHE_WINDOW:    g_cache_aware_window = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
@@ -6943,8 +6946,8 @@ int main(int argc, char **argv) {
                    cache_entries > 0 ? "" : " (disabled)");
         }
         if (g_cache_aware_enabled) {
-            printf("CacheAware: ON (bonus=%.2f, tolerance=%.2f, window=%d tokens)\n",
-                   g_cache_bonus, g_cache_tolerance, g_cache_aware_window);
+            printf("CacheAware: ON (tolerance=%.2f, window=%d tokens)\n",
+                   g_cache_tolerance, g_cache_aware_window);
         }
 
         double t0 = now_ms();
