@@ -1047,25 +1047,34 @@ kernel void gated_delta_net_step(
     uint k_base = kh * 128;
     uint v_base = head_id * 128;
 
-    // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
+    // Load entire state row into registers (1 device memory read)
+    float S[128];
+    for (uint ki = 0; ki < 128; ki++) {
+        S[ki] = state[state_base + ki];
+    }
+
+    // Fused loop 1: decay + kv_mem dot product
     float kv_mem = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        float s = state[state_base + ki] * g;
-        state[state_base + ki] = s;
-        kv_mem += s * k[k_base + ki];
+        S[ki] *= g;
+        kv_mem += S[ki] * k[k_base + ki];
     }
 
-    // Step 3+4: Delta update — S[vi][ki] += k[ki] * delta
+    // Compute delta scalar
     float delta = (v[v_base + vi] - kv_mem) * beta;
-    for (uint ki = 0; ki < 128; ki++) {
-        state[state_base + ki] += k[k_base + ki] * delta;
-    }
 
-    // Step 5: Output — out[vi] = dot(S[vi][:], q[:])
+    // Fused loop 2: state update + output dot product
     float out_val = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        out_val += state[state_base + ki] * q[k_base + ki];
+        S[ki] += k[k_base + ki] * delta;
+        out_val += S[ki] * q[k_base + ki];
     }
+
+    // Write state row back (1 device memory write)
+    for (uint ki = 0; ki < 128; ki++) {
+        state[state_base + ki] = S[ki];
+    }
+
     output[v_base + vi] = out_val;
 }
 
@@ -1136,23 +1145,18 @@ kernel void rms_norm_qk(
     uint tid [[thread_position_in_threadgroup]]
 ) {
     uint base = head * key_dim;
+    uint simd_lane = tid % 32;
+    uint simd_group = tid / 32;
 
-    // RMS norm for q
-    threadgroup float q_sum_sq;
-    if (tid == 0) q_sum_sq = 0;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    // RMS norm for q — SIMD parallel reduction (4 groups of 32)
     float qval = (tid < key_dim) ? q[base + tid] : 0;
-    // Use threadgroup atomic add for sum of squares
-    float q_sq_local = qval * qval;
-    // Simple reduction: thread 0 accumulates (key_dim=128, fits in one pass)
-    threadgroup float q_partial[128];
-    q_partial[tid] = q_sq_local;
+    float q_simd_val = simd_sum(qval * qval);
+    threadgroup float q_shared[4];
+    if (simd_lane == 0) q_shared[simd_group] = q_simd_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float q_sum_sq;
     if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < key_dim; i++) s += q_partial[i];
-        q_sum_sq = s;
+        q_sum_sq = q_shared[0] + q_shared[1] + q_shared[2] + q_shared[3];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float q_inv_rms = rsqrt(q_sum_sq / float(key_dim) + 1e-6f);
@@ -1160,16 +1164,15 @@ kernel void rms_norm_qk(
         q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;  // q gets extra scale
     }
 
-    // RMS norm for k
-    threadgroup float k_sum_sq;
+    // RMS norm for k — SIMD parallel reduction
     float kval = (tid < key_dim) ? k[base + tid] : 0;
-    threadgroup float k_partial[128];
-    k_partial[tid] = kval * kval;
+    float k_simd_val = simd_sum(kval * kval);
+    threadgroup float k_shared[4];
+    if (simd_lane == 0) k_shared[simd_group] = k_simd_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float k_sum_sq;
     if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < key_dim; i++) s += k_partial[i];
-        k_sum_sq = s;
+        k_sum_sq = k_shared[0] + k_shared[1] + k_shared[2] + k_shared[3];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_inv_rms = rsqrt(k_sum_sq / float(key_dim) + 1e-6f);
@@ -1221,20 +1224,22 @@ kernel void gated_rms_norm(
     uint tid [[thread_position_in_threadgroup]]
 ) {
     uint base = head * value_dim;
+    uint simd_lane = tid % 32;
+    uint simd_group = tid / 32;
 
     float val = (tid < value_dim) ? values[base + tid] : 0;
 
-    // RMS norm reduction
-    threadgroup float partial[128];
-    partial[tid] = val * val;
+    // RMS norm — SIMD parallel reduction (4 groups of 32)
+    float simd_val = simd_sum(val * val);
+    threadgroup float shared[4];
+    if (simd_lane == 0) shared[simd_group] = simd_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float total_sq;
     if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < value_dim; i++) s += partial[i];
-        partial[0] = s;
+        total_sq = shared[0] + shared[1] + shared[2] + shared[3];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_rms = rsqrt(partial[0] / float(value_dim) + eps);
+    float inv_rms = rsqrt(total_sq / float(value_dim) + eps);
 
     if (tid < value_dim) {
         float normed = val * inv_rms;
@@ -1293,4 +1298,80 @@ kernel void moe_combine_residual(
     if (K > 7) moe += params[7] * expert_out7[tid];
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+}
+
+
+// ============================================================================
+// Kernel 1c-small: down_proj variant with 4KB threadgroup memory (vs 16KB)
+// ============================================================================
+//
+// Identical to dequant_matvec_4bit_v3 except x_shared is [1024] instead of
+// [4096]. For down_proj (in_dim=1024), this reduces threadgroup memory from
+// 16KB to 4KB, allowing ~4x more concurrent threadgroups per GPU core.
+// On M1 (8 cores) this significantly improves occupancy and latency hiding.
+
+kernel void dequant_matvec_4bit_v3_small(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[1024];  // 4KB vs 16KB in v3
+
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
 }
