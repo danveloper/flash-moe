@@ -493,6 +493,74 @@ kernel void dequant_matvec_2bit(
 
 
 // ============================================================================
+// Kernel 1e: 8-bit dequantized matrix-vector multiply (FMA-optimized)
+// ============================================================================
+// Same structure as dequant_matvec_4bit_v3 but for 8-bit quantization:
+//   - 4 values per uint32 (vs 8 for 4-bit, 16 for 2-bit)
+//   - packed_cols = in_dim / 4
+//   - Extract bytes: (packed >> 0) & 0xFF, >> 8, >> 16, >> 24
+//   - FMA-optimized: (byte * scale + bias) * x = fma(byte, scale*x, bias*x)
+// Used for gate routing weights and shared_expert_gate in Qwen3.5-397B.
+
+kernel void dequant_matvec_8bit(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/4]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 4;  // 4 values per uint32 for 8-bit
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        // group_size/4 packed words per group
+        uint g = col / (group_size / 4);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 4;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+
+        acc += fma(float((packed >>  0) & 0xFF), sx0, bx0);
+        acc += fma(float((packed >>  8) & 0xFF), sx1, bx1);
+        acc += fma(float((packed >> 16) & 0xFF), sx2, bx2);
+        acc += fma(float((packed >> 24) & 0xFF), sx3, bx3);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Kernel 1d: FULLY OPTIMIZED with uint4 vector loads
 // ============================================================================
 //
