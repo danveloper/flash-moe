@@ -2936,14 +2936,7 @@ static void moe_forward(
     int expert_indices[64];
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
-    {
-        float max_val = expert_weights[0];
-        for (int k = 1; k < K; k++) if (expert_weights[k] > max_val) max_val = expert_weights[k];
-        float sum = 0.0f;
-        for (int k = 0; k < K; k++) { expert_weights[k] = expf(expert_weights[k] - max_val); sum += expert_weights[k]; }
-        float inv = 1.0f / sum;
-        for (int k = 0; k < K; k++) expert_weights[k] *= inv;
-    }
+    cpu_softmax(expert_weights, K);  // softmax only K values (not all 512)
 
     if (moe_dump) {
         fprintf(stderr, "[MOE-DUMP] routing: K=%d experts=[", K);
