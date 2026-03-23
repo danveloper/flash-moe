@@ -199,6 +199,32 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
+
+// Co-activation clustering remap: logical expert -> physical file position
+static uint16_t g_expert_remap[NUM_LAYERS][NUM_EXPERTS];  // identity by default
+static int g_remap_loaded = 0;
+
+static void init_expert_remap(void) {
+    for (int l = 0; l < NUM_LAYERS; l++)
+        for (int e = 0; e < NUM_EXPERTS; e++)
+            g_expert_remap[l][e] = (uint16_t)e;
+}
+
+static void load_expert_remap(const char *packed_dir) {
+    init_expert_remap();
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/layer_%02d.map", packed_dir, l);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            fread(g_expert_remap[l], sizeof(uint16_t), NUM_EXPERTS, f);
+            fclose(f);
+            if (l == 0) fprintf(stderr, "[cluster] Loaded expert remap for %d layers\n", NUM_LAYERS);
+            g_remap_loaded = 1;
+        }
+    }
+}
+
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
@@ -2965,7 +2991,8 @@ static void moe_forward(
         size_t esz = active_expert_size();
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][eidx] : eidx;
+            off_t expert_offset = (off_t)phys_eidx * esz;
 
             if (g_metal && g_metal->buf_expert_data) {
                 // GPU path: pread directly into Metal buffer, run gate+up+swiglu+down on GPU
@@ -3287,6 +3314,16 @@ static dispatch_queue_t g_io_gcd_queue = NULL;
 
 static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
     if (num_tasks == 0) return;
+
+    // Sort pread tasks by offset for sequential I/O
+    for (int i = 0; i < num_tasks - 1; i++)
+        for (int j = i + 1; j < num_tasks; j++)
+            if (tasks[j].offset < tasks[i].offset) {
+                InferPreadTask tmp = tasks[i];
+                tasks[i] = tasks[j];
+                tasks[j] = tmp;
+            }
+
     atomic_store_explicit(&g_io_pool.tasks_done, 0, memory_order_relaxed);
     pthread_mutex_lock(&g_io_pool.mutex);
     g_io_pool.tasks = tasks;
@@ -3319,19 +3356,30 @@ typedef struct {
 static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
-                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
+                               int layer_idx) {
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
+        int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][expert_indices[k]] : expert_indices[k];
         g_async_pread.tasks[k].fd = packed_fd;
         g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
-        g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
+        g_async_pread.tasks[k].offset = (off_t)phys_eidx * esz;
         g_async_pread.tasks[k].size = esz;
         g_async_pread.tasks[k].result = 0;
     }
+
+    // Sort pread tasks by offset for sequential I/O
+    for (int i = 0; i < K - 1; i++)
+        for (int j = i + 1; j < K; j++)
+            if (g_async_pread.tasks[j].offset < g_async_pread.tasks[i].offset) {
+                InferPreadTask tmp = g_async_pread.tasks[i];
+                g_async_pread.tasks[i] = g_async_pread.tasks[j];
+                g_async_pread.tasks[j] = tmp;
+            }
 
     // Fire off parallel preads on GCD — returns immediately
     static dispatch_queue_t io_q = NULL;
@@ -3374,14 +3422,16 @@ static int parallel_pread_experts(
     int *expert_indices,
     int K,
     int *valid,  // [MAX_K] output: 1 if expert loaded successfully
-    const void *mmap_base  // mmap'd layer file (NULL to use pread)
+    const void *mmap_base,  // mmap'd layer file (NULL to use pread)
+    int layer_idx
 ) {
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
+        int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][expert_indices[k]] : expert_indices[k];
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
+        tasks[k].offset = (off_t)phys_eidx * esz;
         tasks[k].size = esz;
         tasks[k].result = 0;
         tasks[k].mmap_base = mmap_base;
@@ -3410,14 +3460,16 @@ static int parallel_pread_experts_into(
     int *expert_indices,
     int K,
     id<MTLBuffer> __strong *dst_bufs,  // target Metal buffers (set A or B)
-    int *valid  // [MAX_K] output: 1 if expert loaded successfully
+    int *valid,  // [MAX_K] output: 1 if expert loaded successfully
+    int layer_idx
 ) {
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
+        int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][expert_indices[k]] : expert_indices[k];
         tasks[k].fd = packed_fd;
         tasks[k].dst = [dst_bufs[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
+        tasks[k].offset = (off_t)phys_eidx * esz;
         tasks[k].size = esz;
         tasks[k].result = 0;
     }
@@ -3831,15 +3883,17 @@ static void *infer_prefetch_thread_fn(void *arg) {
 // then signal background prefetch thread.
 static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
                                   int *expert_indices, int K,
-                                  id<MTLBuffer> __strong *dst_bufs) {
+                                  id<MTLBuffer> __strong *dst_bufs,
+                                  int layer_idx) {
     pthread_mutex_lock(&pf->mutex);
     size_t esz = active_expert_size();
     InferIOPlan *plan = &pf->plan;
     plan->fd = packed_fd;
     plan->K = K;
     for (int k = 0; k < K; k++) {
+        int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][expert_indices[k]] : expert_indices[k];
         plan->dst[k] = [dst_bufs[k] contents];
-        plan->offset[k] = (off_t)expert_indices[k] * esz;
+        plan->offset[k] = (off_t)phys_eidx * esz;
         plan->valid[k] = 0;
     }
     plan->loaded = 0;
@@ -4458,7 +4512,8 @@ static void fused_layer_forward(
             g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
             async_pread_start(packed_fd, g_pred_experts[layer_idx],
                               g_pred_count[layer_idx],
-                              g_metal->buf_multi_expert_data_B, mmap_base);
+                              g_metal->buf_multi_expert_data_B, mmap_base,
+                              layer_idx);
             pred_started = 1;
         }
         // Set up residual for CMD2 (residual = hidden before this layer's attention)
@@ -4655,7 +4710,8 @@ static void fused_layer_forward(
                     if (buf && cidx >= 0) {
                         int fd_copy = packed_fd;
                         void *dst = g_malloc_cache->data[cidx];
-                        off_t offset = (off_t)eidx * spec_esz;
+                        int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][eidx] : eidx;
+                        off_t offset = (off_t)phys_eidx * spec_esz;
                         size_t sz = spec_esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
@@ -4675,7 +4731,8 @@ static void fused_layer_forward(
                     if (buf) {
                         int fd_copy = packed_fd;
                         void *dst = [buf contents];
-                        off_t offset = (off_t)eidx * spec_esz;
+                        int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][eidx] : eidx;
+                        off_t offset = (off_t)phys_eidx * spec_esz;
                         size_t sz = spec_esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
@@ -5384,9 +5441,10 @@ static void fused_layer_forward(
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     int cidx = miss_cache_idx[m];
+                    int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][expert_indices[k]] : expert_indices[k];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = g_malloc_cache->data[cidx];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = (off_t)phys_eidx * esz;
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = NULL;  // always pread for cache population
@@ -5439,9 +5497,10 @@ static void fused_layer_forward(
                 InferPreadTask tasks[MAX_K];
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
+                    int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][expert_indices[k]] : expert_indices[k];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = [miss_bufs[m] contents];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = (off_t)phys_eidx * esz;
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = mmap_base;
@@ -5500,9 +5559,10 @@ static void fused_layer_forward(
                 size_t esz = active_expert_size();
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
+                    int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][miss_ei[m]] : miss_ei[m];
                     tasks[m].fd = packed_fd;
                     tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
-                    tasks[m].offset = (off_t)miss_ei[m] * esz;
+                    tasks[m].offset = (off_t)phys_eidx * esz;
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                 }
@@ -5535,7 +5595,8 @@ static void fused_layer_forward(
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
             async_pread_start(packed_fd, expert_indices, actual_K,
-                              g_metal->buf_multi_expert_data, mmap_base);
+                              g_metal->buf_multi_expert_data, mmap_base,
+                              layer_idx);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
@@ -5733,7 +5794,8 @@ static void fused_layer_forward(
         float *expert_out_cpu = malloc(HIDDEN_DIM * sizeof(float));
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            int phys_eidx = g_remap_loaded ? g_expert_remap[layer_idx][eidx] : eidx;
+            off_t expert_offset = (off_t)phys_eidx * esz;
             void *expert_data = malloc(esz);
             ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
             if (nread != (ssize_t)esz) {
@@ -7063,6 +7125,14 @@ int main(int argc, char **argv) {
             }
         }
         printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
+
+        // ---- Co-activation clustering remap: load if available ----
+        {
+            char remap_dir[1024];
+            snprintf(remap_dir, sizeof(remap_dir), "%s/%s",
+                     model_path, g_use_2bit ? "packed_experts_2bit" : "packed_experts");
+            load_expert_remap(remap_dir);
+        }
 
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
