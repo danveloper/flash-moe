@@ -1049,6 +1049,9 @@ static void apply_rope(float *q, float *k, int pos) {
 // Per-layer forward pass
 // ============================================================================
 
+// Expert logging for routing analysis (set EXPERT_LOG=/path to enable)
+static FILE *g_expert_log = NULL;
+
 // Timing accumulator for per-phase breakdown
 static int g_timing_enabled = 0;
 static struct {
@@ -1241,6 +1244,10 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     int expert_ids[MAX_K];
     float expert_weights[MAX_K];
     topk(h_scores, NUM_EXPERTS, K, expert_ids, expert_weights);
+
+    if (g_expert_log)
+        fprintf(g_expert_log, "%d %d %d %d %d\n", layer_idx,
+                expert_ids[0], expert_ids[1], expert_ids[2], expert_ids[3]);
 
     if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.routing += t1-t0; t0=t1; }
 
@@ -2664,6 +2671,8 @@ static void serve_loop(Model *model, char **vocab_strings, bpe_tokenizer *tokeni
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);  // unbuffered stdout for serve mode
+    { const char *elog = getenv("EXPERT_LOG");
+      if (elog) { g_expert_log = fopen(elog, "w"); } }
     const char *weights_path = "model_weights.bin";
     const char *manifest_path = "model_weights.json";
     const char *vocab_path = "vocab.bin";
