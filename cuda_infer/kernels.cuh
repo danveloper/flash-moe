@@ -203,6 +203,135 @@ __global__ void dequant_matvec_4bit_fma_vec4(
 }
 
 // ============================================================================
+// 1c. GGML Q4_K dequant matvec — native GGUF format support
+// ============================================================================
+// Q4_K super-block: 256 elements, 144 bytes (4.5 bits/weight)
+//   d (fp16): super-block scale for quantized scales
+//   dmin (fp16): super-block scale for quantized mins
+//   scales[12]: packed 6-bit per-sub-block scales and mins (8 sub-blocks of 32)
+//   qs[128]: 4-bit quantized values (256 values, 2 per byte)
+// Dequant: value = d * sub_scale * nibble - dmin * sub_min
+
+#define QK_K 256
+#define Q4_K_BLOCK_SIZE 144  // 2+2+12+128 bytes
+
+// Unpack 6-bit scale and min from the packed scales array
+__device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t *q,
+                                                  uint8_t *sc, uint8_t *mn) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *mn = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *mn = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4);
+    }
+}
+
+__global__ void dequant_matvec_q4k(
+    const uint8_t* __restrict__ W_q4k,
+    const float*   __restrict__ x,
+    float*         __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    extern __shared__ float x_shared[];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const uint32_t blocks_per_row = in_dim >> 8;  // in_dim / 256
+
+    const uint32_t tid = warp_id * 32 + lane;
+    for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
+        x_shared[i] = x[i];
+    __syncthreads();
+
+    if (row >= out_dim) return;
+
+    const uint8_t *row_data = W_q4k + (size_t)row * blocks_per_row * Q4_K_BLOCK_SIZE;
+
+    float acc = 0.0f;
+
+    for (uint32_t bi = lane; bi < blocks_per_row; bi += 32) {
+        const uint8_t *block = row_data + bi * Q4_K_BLOCK_SIZE;
+
+        // Load super-block header via __ldg
+        float d    = __half2float(__ldg((const __half *)(block)));
+        float dmin = __half2float(__ldg((const __half *)(block + 2)));
+        const uint8_t *sc_ptr = block + 4;
+        const uint32_t *qs32 = (const uint32_t *)(block + 16);  // 128 bytes = 32 uint32
+
+        uint32_t x_base = bi << 8;  // bi * 256
+
+        // Precompute all 8 scale/min pairs (no branch in inner loop)
+        float d1[8], m1[8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            d1[j] = d * (float)(sc_ptr[j] & 63);
+            m1[j] = dmin * (float)(sc_ptr[j + 4] & 63);
+        }
+        #pragma unroll
+        for (int j = 4; j < 8; j++) {
+            d1[j] = d * (float)((sc_ptr[j + 4] & 0xF) | ((sc_ptr[j - 4] >> 6) << 4));
+            m1[j] = dmin * (float)((sc_ptr[j + 4] >> 4) | ((sc_ptr[j] >> 6) << 4));
+        }
+
+        // Process 8 sub-blocks of 32 elements, 4 uint32 loads per sub-block
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float ds = d1[j];
+            float ms = m1[j];
+            uint32_t xb = x_base + (j << 5);  // j * 32
+            uint32_t qs_off = j << 2;          // j * 4 (in uint32 units)
+
+            // Load 16 bytes (4 uint32) = 32 nibbles via __ldg
+            uint32_t q0 = __ldg(qs32 + qs_off);
+            uint32_t q1 = __ldg(qs32 + qs_off + 1);
+            uint32_t q2 = __ldg(qs32 + qs_off + 2);
+            uint32_t q3 = __ldg(qs32 + qs_off + 3);
+
+            // Low nibbles (first 16 elements) — FMA: fma(nibble, ds*x, -ms*x)
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
+                uint32_t xi = xb + b * 4;
+                float x0 = x_shared[xi+0], x1 = x_shared[xi+1];
+                float x2 = x_shared[xi+2], x3 = x_shared[xi+3];
+                acc += __fmaf_rn((float)((qw >>  0) & 0xF), ds * x0, -ms * x0);
+                acc += __fmaf_rn((float)((qw >>  8) & 0xF), ds * x1, -ms * x1);
+                acc += __fmaf_rn((float)((qw >> 16) & 0xF), ds * x2, -ms * x2);
+                acc += __fmaf_rn((float)((qw >> 24) & 0xF), ds * x3, -ms * x3);
+            }
+            // High nibbles (next 16 elements)
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
+                uint32_t xi = xb + 16 + b * 4;
+                float x0 = x_shared[xi+0], x1 = x_shared[xi+1];
+                float x2 = x_shared[xi+2], x3 = x_shared[xi+3];
+                acc += __fmaf_rn((float)((qw >>  4) & 0xF), ds * x0, -ms * x0);
+                acc += __fmaf_rn((float)((qw >> 12) & 0xF), ds * x1, -ms * x1);
+                acc += __fmaf_rn((float)((qw >> 20) & 0xF), ds * x2, -ms * x2);
+                acc += __fmaf_rn((float)((qw >> 28) & 0xF), ds * x3, -ms * x3);
+            }
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+// Launch helper for Q4_K format
+static inline void launch_dequant_matvec_q4k(
+    const uint8_t* W, const float* x, float* out,
+    uint32_t out_dim, uint32_t in_dim, cudaStream_t stream = 0
+) {
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    size_t smem = in_dim * sizeof(float);
+    dequant_matvec_q4k<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
+}
+
+// ============================================================================
 // 2. SwiGLU: out[i] = SiLU(gate[i]) * up[i]
 // ============================================================================
 
