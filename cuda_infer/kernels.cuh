@@ -125,6 +125,84 @@ __global__ void dequant_matvec_4bit_fma(
 }
 
 // ============================================================================
+// 1b. 4-bit FMA dequant matvec with uint4 vectorized loads
+// ============================================================================
+// Loads 4 × uint32 (128 bits) per instruction instead of 1 × uint32.
+// Each uint4 = 32 nibbles = 32 input elements processed per load.
+// Reduces instruction count and improves memory throughput.
+
+__global__ void dequant_matvec_4bit_fma_vec4(
+    const uint32_t* __restrict__ W_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ biases,
+    const float*    __restrict__ x,
+    float*          __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    extern __shared__ float x_shared[];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    // All divisions by powers of 2 → shifts. No runtime division.
+    const uint32_t packed_cols = in_dim >> 3;        // in_dim / 8
+    const uint32_t num_groups = in_dim >> 6;         // in_dim / 64 (GROUP_SIZE=64)
+    const uint32_t vec4_cols = packed_cols >> 2;      // packed_cols / 4
+
+    // Cooperative load — all threads must participate before barrier
+    const uint32_t tid = warp_id * 32 + lane;
+    for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
+        x_shared[i] = x[i];
+    __syncthreads();
+
+    if (row >= out_dim) return;
+
+    const uint4* w_row_v = (const uint4*)(W_packed + row * packed_cols);
+    const uint16_t* s_row = scales + row * num_groups;
+    const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint32_t vi = lane; vi < vec4_cols; vi += 32) {
+        uint4 packed4 = __ldg(w_row_v + vi);  // read-through L1 cache
+        uint32_t base_col = vi << 2;
+        uint32_t x_base = base_col << 3;      // base_col * 8
+
+        #pragma unroll
+        for (uint32_t w = 0; w < 4; w++) {
+            uint32_t packed = ((const uint32_t*)&packed4)[w];
+            // group index: (base_col + w) / 8 = (base_col + w) >> 3
+            // (packed_per_group = GROUP_SIZE/8 = 8)
+            uint32_t g = (base_col + w) >> 3;
+            float scale = bf16_to_f32(__ldg(s_row + g));
+            float bias  = bf16_to_f32(__ldg(b_row + g));
+            uint32_t xb = x_base + (w << 3);  // w * 8
+
+            float sx0 = scale * x_shared[xb+0]; float bx0 = bias * x_shared[xb+0];
+            float sx1 = scale * x_shared[xb+1]; float bx1 = bias * x_shared[xb+1];
+            float sx2 = scale * x_shared[xb+2]; float bx2 = bias * x_shared[xb+2];
+            float sx3 = scale * x_shared[xb+3]; float bx3 = bias * x_shared[xb+3];
+            float sx4 = scale * x_shared[xb+4]; float bx4 = bias * x_shared[xb+4];
+            float sx5 = scale * x_shared[xb+5]; float bx5 = bias * x_shared[xb+5];
+            float sx6 = scale * x_shared[xb+6]; float bx6 = bias * x_shared[xb+6];
+            float sx7 = scale * x_shared[xb+7]; float bx7 = bias * x_shared[xb+7];
+
+            acc += __fmaf_rn((float)((packed >>  0) & 0xF), sx0, bx0);
+            acc += __fmaf_rn((float)((packed >>  4) & 0xF), sx1, bx1);
+            acc += __fmaf_rn((float)((packed >>  8) & 0xF), sx2, bx2);
+            acc += __fmaf_rn((float)((packed >> 12) & 0xF), sx3, bx3);
+            acc += __fmaf_rn((float)((packed >> 16) & 0xF), sx4, bx4);
+            acc += __fmaf_rn((float)((packed >> 20) & 0xF), sx5, bx5);
+            acc += __fmaf_rn((float)((packed >> 24) & 0xF), sx6, bx6);
+            acc += __fmaf_rn((float)((packed >> 28) & 0xF), sx7, bx7);
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+// ============================================================================
 // 2. SwiGLU: out[i] = SiLU(gate[i]) * up[i]
 // ============================================================================
 
@@ -550,7 +628,7 @@ static inline void launch_dequant_matvec(
     dim3 block(32, ROWS_PER_BLOCK);
     dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
     size_t smem = in_dim * sizeof(float);
-    dequant_matvec_4bit_fma<<<grid, block, smem, stream>>>(W, scales, biases, x, out, out_dim, in_dim);
+    dequant_matvec_4bit_fma_vec4<<<grid, block, smem, stream>>>(W, scales, biases, x, out, out_dim, in_dim);
 }
 
 static inline void launch_swiglu(const float* gate, const float* up, float* out, uint32_t dim, cudaStream_t s = 0) {

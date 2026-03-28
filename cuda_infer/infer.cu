@@ -519,16 +519,22 @@ typedef struct {
     size_t d_weights_size;
 
     // ---- VRAM expert cache ----
-    // LRU cache of recently-used experts in GPU memory.
-    // Avoids SSD reads for hot experts (~95% hit rate with 18GB).
+    // Frequency-weighted LRU cache of experts in GPU memory.
+    // Eviction score = access_count * FREQ_WEIGHT + last_used.
+    // Hot experts (high access_count) survive even if not used for a few tokens.
     void *vram_cache_pool;          // [vram_cache_capacity * EXPERT_SIZE] GPU memory
     int vram_cache_capacity;        // max experts that fit
     int vram_cache_used;            // current fill level
-    uint64_t vram_cache_clock;      // LRU clock (increments per access)
+    uint64_t vram_cache_clock;      // clock (increments per access)
     // Direct-mapped lookup: cache_map[layer][expert] = slot index (-1 = not cached)
     int cache_map[NUM_LAYERS][NUM_EXPERTS];
     // Per-slot metadata
-    struct { int layer; int expert_id; uint64_t last_used; } *cache_slots;
+    struct {
+        int layer;
+        int expert_id;
+        uint64_t last_used;   // clock value at last access
+        uint32_t access_count; // total accesses since cached
+    } *cache_slots;
 
 } Model;
 
@@ -1273,6 +1279,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                 // Cache hit — point directly at VRAM cache slot
                 expert_ptrs[k] = (char *)model->vram_cache_pool + (size_t)slot * EXPERT_SIZE;
                 model->cache_slots[slot].last_used = model->vram_cache_clock;
+                model->cache_slots[slot].access_count++;
             } else {
                 // Cache miss — need SSD load
                 need_ssd[n_ssd] = k;
@@ -1306,12 +1313,18 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                     // Free slot available
                     slot = model->vram_cache_used++;
                 } else if (model->vram_cache_capacity > 0) {
-                    // Evict LRU
-                    uint64_t min_used = UINT64_MAX;
+                    // Evict: frequency-weighted LRU
+                    // Score = access_count * FREQ_WEIGHT + last_used
+                    // Higher score = more valuable = keep longer
+                    // Evict the slot with the lowest score
+                    #define FREQ_WEIGHT 10  // each access = 10 clock ticks of recency
+                    uint64_t min_score = UINT64_MAX;
                     int min_slot = 0;
                     for (int s = 0; s < model->vram_cache_capacity; s++) {
-                        if (model->cache_slots[s].last_used < min_used) {
-                            min_used = model->cache_slots[s].last_used;
+                        uint64_t score = (uint64_t)model->cache_slots[s].access_count * FREQ_WEIGHT
+                                       + model->cache_slots[s].last_used;
+                        if (score < min_score) {
+                            min_score = score;
                             min_slot = s;
                         }
                     }
@@ -1334,6 +1347,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                     model->cache_slots[slot].layer = layer_idx;
                     model->cache_slots[slot].expert_id = eid;
                     model->cache_slots[slot].last_used = model->vram_cache_clock;
+                    model->cache_slots[slot].access_count = 1;
                     model->cache_map[layer_idx][eid] = slot;
                     expert_ptrs[k] = tmp;  // use temp buffer now, cache fills in background
                 } else {
