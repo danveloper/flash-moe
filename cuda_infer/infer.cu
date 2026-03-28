@@ -39,40 +39,82 @@ extern "C" {
 }
 
 // ============================================================================
-// Model constants
+// Model constants — defaults for Qwen3.5-397B-A17B
+// Override at compile time with -DHIDDEN_DIM=3072 etc. for other models.
 // ============================================================================
 
+#ifndef HIDDEN_DIM
 #define HIDDEN_DIM          4096
+#endif
+#ifndef NUM_LAYERS
 #define NUM_LAYERS          60
+#endif
+#ifndef NUM_ATTN_HEADS
 #define NUM_ATTN_HEADS      32
+#endif
+#ifndef NUM_KV_HEADS
 #define NUM_KV_HEADS        2
+#endif
+#ifndef HEAD_DIM
 #define HEAD_DIM            256
+#endif
+#ifndef VOCAB_SIZE
 #define VOCAB_SIZE          248320
+#endif
 #define RMS_NORM_EPS        1e-6f
+#ifndef NUM_EXPERTS
 #define NUM_EXPERTS         512
+#endif
+#ifndef MOE_INTERMEDIATE
 #define MOE_INTERMEDIATE    1024
+#endif
+#ifndef SHARED_INTERMEDIATE
 #define SHARED_INTERMEDIATE 1024
+#endif
+#ifndef FULL_ATTN_INTERVAL
 #define FULL_ATTN_INTERVAL  4
+#endif
 #define GROUP_SIZE_C        64
 
 // Linear attention (GatedDeltaNet)
+#ifndef LINEAR_NUM_V_HEADS
 #define LINEAR_NUM_V_HEADS  64
+#endif
+#ifndef LINEAR_NUM_K_HEADS
 #define LINEAR_NUM_K_HEADS  16
+#endif
+#ifndef LINEAR_KEY_DIM
 #define LINEAR_KEY_DIM      128
+#endif
+#ifndef LINEAR_VALUE_DIM
 #define LINEAR_VALUE_DIM    128
-#define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 8192
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 12288
+#endif
+#define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)
+#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM)
+#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE)
+#ifndef CONV_KERNEL_SIZE
 #define CONV_KERNEL_SIZE    4
+#endif
 
 // Full attention
+#ifndef ROPE_THETA
 #define ROPE_THETA          10000000.0f
+#endif
+#ifndef PARTIAL_ROTARY
 #define PARTIAL_ROTARY      0.25f
-#define ROTARY_DIM          ((int)(HEAD_DIM * PARTIAL_ROTARY))  // 64
+#endif
+#define ROTARY_DIM          ((int)(HEAD_DIM * PARTIAL_ROTARY))
 #define MAX_SEQ_LEN         4096
 
-// Expert layout
-#define EXPERT_SIZE         7077888
+// Expert layout — computed from dimensions if not overridden
+#ifndef EXPERT_SIZE
+#define EXPERT_SIZE         (MOE_INTERMEDIATE * (HIDDEN_DIM/8) * 4 \
+                           + MOE_INTERMEDIATE * (HIDDEN_DIM/GROUP_SIZE_C) * 2 * 2 \
+                           + MOE_INTERMEDIATE * (HIDDEN_DIM/8) * 4 \
+                           + MOE_INTERMEDIATE * (HIDDEN_DIM/GROUP_SIZE_C) * 2 * 2 \
+                           + HIDDEN_DIM * (MOE_INTERMEDIATE/8) * 4 \
+                           + HIDDEN_DIM * (MOE_INTERMEDIATE/GROUP_SIZE_C) * 2 * 2)
+#endif
 #define MAX_K               8
 
 #define CHECK_CUDA(call) do { \
@@ -941,16 +983,28 @@ static void load_experts(Model *model, int layer_idx, const int *expert_ids, int
 // Expert forward pass (one expert on GPU)
 // ============================================================================
 
-// Expert component offsets within EXPERT_SIZE bytes
+// Expert component offsets — computed from model dimensions
+// Layout: gate(W,S,B) + up(W,S,B) + down(W,S,B)
+// W: [out, in/8] uint32, S: [out, in/64] bf16, B: [out, in/64] bf16
+#define EXP_GATE_W_SZ  (MOE_INTERMEDIATE * (HIDDEN_DIM / 8) * 4)
+#define EXP_GATE_S_SZ  (MOE_INTERMEDIATE * (HIDDEN_DIM / GROUP_SIZE_C) * 2)
+#define EXP_GATE_B_SZ  EXP_GATE_S_SZ
+#define EXP_UP_W_SZ    EXP_GATE_W_SZ
+#define EXP_UP_S_SZ    EXP_GATE_S_SZ
+#define EXP_UP_B_SZ    EXP_GATE_S_SZ
+#define EXP_DOWN_W_SZ  (HIDDEN_DIM * (MOE_INTERMEDIATE / 8) * 4)
+#define EXP_DOWN_S_SZ  (HIDDEN_DIM * (MOE_INTERMEDIATE / GROUP_SIZE_C) * 2)
+#define EXP_DOWN_B_SZ  EXP_DOWN_S_SZ
+
 #define EXP_GATE_W   0
-#define EXP_GATE_S   2097152
-#define EXP_GATE_B   2228224
-#define EXP_UP_W     2359296
-#define EXP_UP_S     4456448
-#define EXP_UP_B     4587520
-#define EXP_DOWN_W   4718592
-#define EXP_DOWN_S   6815744
-#define EXP_DOWN_B   6946816
+#define EXP_GATE_S   (EXP_GATE_W + EXP_GATE_W_SZ)
+#define EXP_GATE_B   (EXP_GATE_S + EXP_GATE_S_SZ)
+#define EXP_UP_W     (EXP_GATE_B + EXP_GATE_B_SZ)
+#define EXP_UP_S     (EXP_UP_W + EXP_UP_W_SZ)
+#define EXP_UP_B     (EXP_UP_S + EXP_UP_S_SZ)
+#define EXP_DOWN_W   (EXP_UP_B + EXP_UP_B_SZ)
+#define EXP_DOWN_S   (EXP_DOWN_W + EXP_DOWN_W_SZ)
+#define EXP_DOWN_B   (EXP_DOWN_S + EXP_DOWN_S_SZ)
 
 static void expert_forward(Model *model, int expert_slot, const float *input, float *output) {
     void *base = (char *)model->buf_expert_data + expert_slot * EXPERT_SIZE;
