@@ -1245,7 +1245,6 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.routing += t1-t0; t0=t1; }
 
     // 5. Shared expert forward + expert I/O OVERLAP
-    // Launch shared expert on GPU compute stream while loading experts from SSD
     launch_dequant_matvec(L.sg_w, L.sg_s, L.sg_b, model->buf_normed,
                           model->buf_shared_gate, SHARED_INTERMEDIATE, HIDDEN_DIM);
     launch_dequant_matvec(L.su_w, L.su_s, L.su_b, model->buf_normed,
@@ -1365,7 +1364,6 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
     // 7. Expert forward (K experts on GPU, using cached pointers)
     for (int k = 0; k < K; k++) {
-        // expert_forward from arbitrary VRAM location
         void *base = expert_ptrs[k];
 
         uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);

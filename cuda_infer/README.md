@@ -2,7 +2,7 @@
 
 CUDA/C port of [Flash-MoE](../CLAUDE.md) for x86 PCs with NVIDIA GPUs. Runs **Qwen3.5-397B-A17B** (397 billion parameter MoE model) on a single RTX 4090 with 24GB VRAM, streaming 209GB of expert weights from NVMe SSD.
 
-**3.55 tokens/second** (warm cache) with tool calling, OpenAI-compatible API, and SSE streaming. No Python. No frameworks. One CUDA file + one kernel header.
+**5.35 tokens/second** (avg on RTX 4090, 5.86 peak) with tool calling, OpenAI-compatible API, and SSE streaming. No Python. No frameworks. One CUDA file + one kernel header.
 
 ## How It Works
 
@@ -22,25 +22,40 @@ Each token requires loading 4 experts × 60 layers = 240 expert reads (~6.75MB e
 2. **OS page cache** (~50GB with 64GB RAM): Experts not in VRAM are read via `pread()`, which populates the OS page cache. Repeat accesses hit RAM at ~10 GB/s.
 3. **NVMe SSD**: Cold misses go to SSD at ~5-7 GB/s.
 
-The VRAM cache warms progressively: 2.49 tok/s cold → 3.22 after one request → **3.55 tok/s** after a few requests. GDS (direct NVMe-to-GPU DMA) is available for low-RAM systems via `ENABLE_GDS=1` but bypasses the page cache, so it's slower for sustained generation.
+The VRAM cache warms progressively: cold → warm → hot over a few requests. GDS (direct NVMe-to-GPU DMA) is available for low-RAM systems via `ENABLE_GDS=1` but bypasses the page cache, so it's slower for sustained generation.
 
 ## Results
 
-| Configuration | tok/s | Hardware | Notes |
-|--------------|-------|----------|-------|
-| **Flash-MoE CUDA** | **3.55** | 1x RTX 4090, 64GB RAM, 2TB NVMe | This project. VRAM cache + page cache + SSD. |
-| Flash-MoE Metal (Apple) | 4.36 | M3 Max 48GB, 1TB NVMe | Original project. Unified memory. |
+### Multi-Hardware Benchmarks
+
+| GPU | VRAM | RAM | Disk | VRAM Cache | Avg tok/s | Peak tok/s |
+|-----|------|-----|------|------------|-----------|-----------|
+| **RTX 4090** | 24 GB | 64 GB | NVMe 7 GB/s | 2565 experts | **5.35** | **5.86** |
+| **RTX 3060** | 12 GB | 755 GB | NVMe 9 GB/s | 840 experts | **2.92** | **3.23** |
+| RTX 2080 Ti | 11 GB | 16 GB | virtio 520 MB/s | 647 experts | 0.51 | 0.54 |
+| Apple M3 Max | 48 GB unified | — | NVMe 17.5 GB/s | — | 4.36 | — |
+
+### VRAM Cache Warm-Up (RTX 4090)
+
+| Request | tok/s | Improvement |
+|---------|-------|-------------|
+| 1 (cold) | 2.49 | baseline |
+| 2 | 3.22 | +29% |
+| 4 | 5.25 | +111% |
+| 8 (hot) | 5.86 | +135% |
 
 ### Comparison with Other Solutions
 
 | System | Qwen3.5-397B | Hardware Required | Approach |
 |--------|-------------|-------------------|----------|
-| **Flash-MoE CUDA** | **3.55 tok/s** | **1x RTX 4090 + 16GB+ RAM + NVMe** | VRAM cache + page cache + SSD |
+| **Flash-MoE CUDA** | **5.35 tok/s** | **1x RTX 4090 + 16GB+ RAM + NVMe** | VRAM cache + page cache + SSD |
 | KTransformers | ~14 tok/s* | 1x RTX 4090 + **384GB RAM** | CPU expert compute (AMX), GPU attention |
 | llama.cpp (offload) | ~1-2 tok/s | 1x RTX 4090 + **256GB RAM** | CPU/GPU layer split, GGUF |
 | KTransformers (full) | ~150 tok/s | **4x RTX 4090 + 800GB RAM** | Multi-GPU tensor parallelism |
 
 *KTransformers single-GPU numbers are for Qwen3-235B (smaller model); 397B numbers not published for single GPU.
+
+**Key finding**: VRAM size is the dominant performance factor. The RTX 3060 (12GB) with 755GB RAM and fast NVMe is slower than the RTX 4090 (24GB) with 64GB RAM because the smaller VRAM cache (840 vs 2565 experts) means more cache misses requiring SSD or page cache reads.
 
 **Key advantage**: Flash-MoE CUDA requires only **16GB RAM** (process uses 5.5GB; more RAM = better page cache but not required) vs 256-384GB for alternatives.
 
