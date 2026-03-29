@@ -51,7 +51,7 @@
 \begin{abstract}
 We port Flash-MoE---a system for running Qwen3.5-397B-A17B (397 billion parameters) from NVMe SSD on consumer hardware---from Apple Silicon to x86/NVIDIA GPUs. The discrete GPU architecture presents fundamentally different constraints: a PCIe bus separates GPU VRAM from system RAM and SSD, eliminating the unified memory advantage that made the original system possible at 4.36~tok/s on an M3~Max.
 
-Our key contribution is a \emph{three-tier expert caching hierarchy}: (1)~a frequency-weighted LRU cache in GPU VRAM ($\sim$17\,GB, $\sim$2500 experts), (2)~the OS page cache in system RAM ($\sim$50\,GB), and (3)~NVMe SSD for cold misses. After a brief warm-up period (3--8 requests), this hierarchy achieves 5.35~tok/s steady-state (5.86~peak) on an RTX~4090, starting from 2.49~tok/s cold---23\% faster than the Apple Silicon version at steady state, despite 2.5$\times$ slower SSD bandwidth. We also contribute a vec4 FMA-optimized CUDA dequantization kernel, multi-hardware benchmarks across three GPU generations (RTX~4090/3060/2080\,Ti), and a systematic analysis of seven optimization strategies, four of which proved counterproductive.
+Our key contribution is a \emph{three-tier expert caching hierarchy}: (1)~a frequency-weighted LRU cache in GPU VRAM ($\sim$17\,GB, $\sim$2500 experts), (2)~the OS page cache in system RAM ($\sim$50\,GB), and (3)~NVMe SSD for cold misses. After a brief warm-up period (3--8 requests), this hierarchy achieves $5.57 \pm 0.12$~tok/s steady-state ($n=15$) on an RTX~4090, starting from 2.20~tok/s cold---28\% faster than the Apple Silicon version once the VRAM cache is warm, despite 2.5$\times$ slower SSD bandwidth. We also contribute a vec4 FMA-optimized CUDA dequantization kernel, multi-hardware benchmarks across three GPU generations (RTX~4090/3060/2080\,Ti), and a systematic analysis of seven optimization strategies, four of which proved counterproductive.
 
 The complete engine is two files ($\sim$2500 lines), supports OpenAI and Anthropic streaming APIs with tool calling, and requires only 16\,GB of system RAM.
 \end{abstract}
@@ -59,7 +59,7 @@ The complete engine is two files ($\sim$2500 lines), supports OpenAI and Anthrop
 % ============================================================================
 \section{Introduction}
 
-Flash-MoE~\cite{flashmoe} demonstrated that Mixture-of-Experts models vastly exceeding DRAM capacity can run at interactive speeds on consumer hardware by streaming expert weights from NVMe SSD. On an Apple M3~Max with 48\,GB unified memory, the system achieves 4.36~tok/s on Qwen3.5-397B-A17B (209\,GB at 4-bit), exploiting the unified memory architecture where CPU, GPU, and SSD share a single address space with $\sim$400\,GB/s bandwidth.
+Flash-MoE~\cite{flashmoe} demonstrated that Mixture-of-Experts models~\cite{mixtral,deepseekv3} vastly exceeding DRAM capacity can run at interactive speeds on consumer hardware by streaming expert weights from NVMe SSD. On an Apple M3~Max with 48\,GB unified memory, the system achieves 4.36~tok/s on Qwen3.5-397B-A17B (209\,GB at 4-bit), exploiting the unified memory architecture where CPU, GPU, and SSD share a single address space with $\sim$400\,GB/s bandwidth.
 
 We ask: \emph{can the same approach work on commodity x86 PCs with discrete NVIDIA GPUs?} The architecture is fundamentally different:
 
@@ -74,7 +74,7 @@ Naively porting the SSD streaming approach yields $\sim$2\,tok/s---adequate but 
 
 \paragraph{Contributions.}
 \begin{enumerate}[nosep]
-    \item A three-tier expert caching hierarchy (VRAM $\to$ page cache $\to$ SSD) achieving 5.35~tok/s sustained on RTX~4090, surpassing the Apple Silicon version by 23\%.
+    \item A three-tier expert caching hierarchy (VRAM $\to$ page cache $\to$ SSD) achieving $5.57 \pm 0.12$~tok/s sustained on RTX~4090, surpassing the Apple Silicon version by 28\%.
     \item A frequency-weighted LRU eviction policy that outperforms pure LRU by 34\% on warm workloads.
     \item The discovery that NVIDIA GPUDirect Storage (GDS) is counterproductive for sustained inference because it bypasses the OS page cache.
     \item A vec4 FMA-optimized CUDA dequantization kernel with 128-bit loads, bit-shift addressing, and \texttt{\_\_ldg()} cache hints.
@@ -98,9 +98,9 @@ Pre-gated MoE~\cite{pregated} predicts expert activation from earlier layers to 
 
 \subsection{MoE Offloading Systems}
 
-KTransformers~\cite{ktransformers} demonstrates CPU/GPU hybrid inference for MoE models, achieving $\sim$14~tok/s on Qwen3-235B with AMX-optimized CPU kernels for expert computation and GPU for attention. This approach avoids I/O entirely when experts fit in RAM but requires 384\,GB of system memory. At our target configuration (64\,GB RAM), KTransformers would rely on mmap paging, negating its CPU compute advantage. MoE-Lightning~\cite{moelightning} introduces paged weight management for throughput-oriented (batched) serving, whereas our system targets single-request latency. FlexGen~\cite{flexgen} demonstrated CPU--GPU--SSD offloading for dense models but does not address MoE expert sparsity. DeepSpeed-MoE~\cite{deepspeedmoe} provides expert parallelism across multiple GPUs in data center settings; our work targets consumer hardware with a single GPU.
+KTransformers~\cite{ktransformers} demonstrates CPU/GPU hybrid inference for MoE models, achieving $\sim$14~tok/s on Qwen3-235B with AMX-optimized CPU kernels for expert computation and GPU for attention. This approach avoids I/O entirely when experts fit in RAM but requires 384\,GB of system memory. At our target configuration (64\,GB RAM), KTransformers would rely on mmap paging, negating its CPU compute advantage. MoE-Lightning~\cite{moelightning} introduces paged weight management for throughput-oriented (batched) serving, whereas our system targets single-request latency. MoE-Gen~\cite{moegen} batches expert computations across requests to improve GPU utilization, complementary to our single-request streaming approach. FloE~\cite{floe} proposes on-the-fly expert loading with adaptive scheduling for memory-constrained GPUs; our three-tier caching hierarchy addresses a similar constraint but adds the SSD tier for models exceeding total DRAM capacity. FlexGen~\cite{flexgen} demonstrated CPU--GPU--SSD offloading for dense models but does not address MoE expert sparsity. DeepSpeed-MoE~\cite{deepspeedmoe} provides expert parallelism across multiple GPUs in data center settings; our work targets consumer hardware with a single GPU.
 
-S-LoRA~\cite{slora} addresses variable-size adapter weight management in GPU VRAM using unified memory pools---the memory management technique (dynamic allocation within a fixed VRAM pool) is conceptually similar to our expert cache, though applied to LoRA adapters rather than MoE experts.
+S-LoRA~\cite{slora} addresses variable-size adapter weight management in GPU VRAM using unified memory pools; the memory management technique (dynamic allocation within a fixed VRAM pool) is conceptually similar to our expert cache, though applied to LoRA adapters rather than MoE experts.
 
 \subsection{Cache Replacement Policies}
 
@@ -146,7 +146,7 @@ The central architectural difference from Flash-MoE is our three-tier caching hi
 \paragraph{Tier 1: VRAM Expert Cache.}
 After loading non-expert weights (5.2\,GB), the remaining VRAM is allocated as a frequency-weighted LRU cache. On RTX~4090, this provides $\sim$17\,GB for $\sim$2565 expert slots (8.3\% of the 30,720 total across 60 layers). Each slot holds one expert's complete weight data (6.75\,MB at 4-bit quantization: gate, up, and down projection weights, scales, and biases).
 
-On cache hit, the expert data is accessed directly from VRAM at 1008\,GB/s---effectively zero latency. On cache miss, the expert is loaded from a lower tier and asynchronously copied to a cache slot via device-to-device \texttt{cudaMemcpyAsync}.
+On cache hit, the expert data is accessed directly from VRAM at 1008\,GB/s, effectively zero latency. On cache miss, the expert is loaded from a lower tier and asynchronously copied to a cache slot via device-to-device \texttt{cudaMemcpyAsync}.
 
 \paragraph{Tier 2: OS Page Cache.}
 Cache misses are served via \texttt{pread()} from the expert binary files. This populates the Linux page cache, so subsequent reads of the same expert hit system RAM at $\sim$10\,GB/s without SSD access. With 64\,GB RAM, the page cache grows to $\sim$50\,GB during sustained generation, caching roughly half the 203\,GB expert data.
@@ -162,7 +162,7 @@ Pure LRU eviction is suboptimal because some experts are structurally ``hot''---
 \]
 where $W=10$ (each access is worth 10 clock ticks of recency). The slot with the lowest score is evicted. This prevents a frequently-used expert from being evicted after a single topic change, while still allowing stale entries to be reclaimed.
 
-Empirically, frequency-weighted eviction achieves 5.86~tok/s peak vs.\ 3.55 for pure LRU---a 65\% improvement at steady state (Table~\ref{tab:results}).
+Empirically, frequency-weighted eviction achieves 5.80~tok/s peak vs.\ 3.55 for pure LRU---a 63\% improvement at steady state (Table~\ref{tab:results}).
 
 \paragraph{W sensitivity.} We evaluated $W \in \{0, 1, 5, 10, 20, 50\}$ on the RTX~4090. Steady-state throughput (warm cache, last 2 of 8 requests) ranged from 4.64~tok/s ($W=0$, pure LRU) to 4.94~tok/s ($W=5$), a span of only 6\%. The parameter is not sensitive: any $W \geq 1$ outperforms pure LRU, and values from 1 to 50 perform within 2\% of each other. We chose $W=10$ as a conservative default. The frequency weighting's primary benefit is during the warm-up phase (first 3--5 requests), where it preserves hot experts from early-layer eviction pressure.
 
@@ -208,12 +208,12 @@ Steps 7 and 8 are overlapped: the shared expert runs on the GPU while expert dat
 
 \subsection{Performance Progression}
 
-Table~\ref{tab:results} summarizes our optimization trajectory on the RTX~4090.
+Table~\ref{tab:results} summarizes our optimization trajectory on the RTX~4090. Unless otherwise noted, all throughput measurements report the median of 5 independent runs (each generating 20 tokens) with the standard deviation indicated where applicable. Cold-start measurements flush the OS page cache via \texttt{/proc/sys/vm/drop\_caches} before each run.
 
 \begin{table}[h]
 \centering
 \small
-\caption{Performance progression on RTX~4090 (64\,GB RAM, NVMe 7\,GB/s). All measurements use $K=4$ experts, 4-bit quantization, 20+ token generation.}
+\caption{Performance progression on RTX~4090 (64\,GB RAM, NVMe 7\,GB/s). All measurements use $K=4$ experts, 4-bit quantization, 20+ token generation. Rows 1--4 are single measurements from intermediate code versions; the final row reports $n=15$ runs across two independent server sessions.}
 \label{tab:results}
 \begin{tabular}{lcc}
 \toprule
@@ -223,8 +223,8 @@ Initial port (GDS, no cache) & 2.45 & --- \\
 + Page cache (disable GDS) & 2.52 & +3\% \\
 + VRAM cache (pure LRU) & 3.55 & +45\% \\
 + Frequency-weighted LRU & 4.74 peak & +93\% \\
-+ vec4 kernel + shifts + \texttt{\_\_ldg} & \textbf{5.35 avg} & +118\% \\
-& \textbf{5.86 peak} & +139\% \\
++ vec4 kernel + shifts + \texttt{\_\_ldg} & \textbf{5.57$\pm$0.12 avg} & +127\% \\
+& \textbf{5.80 peak} & +137\% \\
 \midrule
 Apple M3 Max (reference) & 4.36 & --- \\
 \bottomrule
@@ -244,8 +244,8 @@ We benchmarked llama.cpp (commit \texttt{master}, CUDA build) on the same RTX~40
 \toprule
 \textbf{System} & \textbf{Config} & \textbf{tok/s} & \textbf{RAM Used} \\
 \midrule
-\textbf{Flash-MoE CUDA} & VRAM cache (warm) & \textbf{5.35} & 5.5 GB \\
-Flash-MoE CUDA & Cold start & 2.49 & 5.5 GB \\
+\textbf{Flash-MoE CUDA} & VRAM cache (warm) & \textbf{5.57$\pm$0.12} & 5.5 GB \\
+Flash-MoE CUDA & Cold start & 2.20 & 5.5 GB \\
 \midrule
 llama.cpp & \texttt{-ngl 99} (full GPU) & OOM & --- \\
 llama.cpp & \texttt{-ngl 0} (CPU only) & $<$0.05$^\dagger$ & 54 GB \\
@@ -257,7 +257,7 @@ $^\dagger$\textit{llama.cpp CPU-only mode ran for over 2 hours without completin
 
 With \texttt{-ngl 99} (full GPU offload), llama.cpp crashes because the 228\,GB model cannot fit in 24\,GB of VRAM. With \texttt{-ngl 0} (CPU-only), llama.cpp memory-maps the entire GGUF file (258\,GB virtual, 54\,GB resident), consuming nearly all system RAM for weight data and leaving no room for effective page caching.
 
-Flash-MoE's approach---streaming only the 4 active experts per layer ($\sim$27\,MB/layer) rather than mapping the entire model---avoids this fundamental problem. The VRAM expert cache further eliminates 95\% of I/O for sustained generation, achieving over 100$\times$ higher throughput than llama.cpp on the same hardware.
+Flash-MoE's approach---streaming only the 4 active experts per layer ($\sim$27\,MB/layer) rather than mapping the entire model---avoids this fundamental problem. The VRAM expert cache further eliminates 95\% of I/O for sustained same-topic generation, achieving over 100$\times$ higher throughput than llama.cpp on the same hardware.
 
 \subsection{VRAM Cache Warm-Up}
 
@@ -266,21 +266,26 @@ The VRAM cache warms progressively over requests in server mode:
 \begin{table}[h]
 \centering
 \small
-\caption{VRAM cache warm-up progression (RTX~4090, server mode, 20 tokens per request).}
+\caption{VRAM cache warm-up progression (RTX~4090, server mode, 20 tokens per request, page cache flushed before start).}
 \label{tab:warmup}
 \begin{tabular}{cccc}
 \toprule
 \textbf{Request} & \textbf{tok/s} & \textbf{Improvement} & \textbf{Cache State} \\
 \midrule
-1 & 2.49 & baseline & empty \\
-2 & 3.22 & +29\% & warming \\
-4 & 5.25 & +111\% & hot \\
-8 & 5.86 & +135\% & $\sim$95\% hit rate \\
+1 & 2.20 & baseline & empty \\
+2 & 2.39 & +9\% & warming \\
+4 & 2.77 & +26\% & warming \\
+8 & 2.82 & +28\% & page cache warm \\
+\midrule
+\multicolumn{4}{l}{\emph{Same-topic sustained (after warm-up):$^\ddagger$}} \\
+--- & 5.57$\pm$0.12 & +153\% & VRAM cache hot \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-After 4--8 requests, approximately 95\% of expert accesses hit the VRAM cache, reducing average I/O per layer from 5.8\,ms (SSD) to $\sim$0.3\,ms (VRAM).
+$^\ddagger$\textit{Measured after 3+ repeated queries on the same topic, which fills the VRAM cache with that topic's expert working set ($n=15$, two independent server sessions).}
+
+The warm-up trajectory depends on prompt diversity. With varied topics (rows 1--8), the VRAM cache benefits are limited because each topic activates different experts; throughput plateaus at $\sim$2.8~tok/s from page cache hits alone. Once queries converge on a topic (bottom row), the VRAM cache fills rapidly (2--3 requests) and throughput reaches $5.57 \pm 0.12$~tok/s as $\sim$95\% of expert accesses hit VRAM, reducing average I/O per layer from 5.8\,ms (SSD) to $\sim$0.3\,ms (VRAM).
 
 \subsection{Per-Phase Timing}
 
@@ -309,7 +314,7 @@ MoE combine + residual & 0.01 & 0.2\% \\
 \end{tabular}
 \end{table}
 
-GPU compute accounts for only 0.54\,ms per layer (8\%). The remaining 87\% is I/O---precisely the bottleneck that the VRAM cache targets.
+GPU compute accounts for only 0.54\,ms per layer (8\%). The remaining 87\% is I/O, precisely the bottleneck that the VRAM cache targets.
 
 \subsection{Multi-Hardware Benchmarks}
 
@@ -324,8 +329,8 @@ GPU compute accounts for only 0.54\,ms per layer (8\%). The remaining 87\% is I/
 \midrule
 VRAM cache slots & 2565 & 840 & 647 \\
 Cache \% of total & 8.3\% & 2.7\% & 2.1\% \\
-Avg tok/s & \textbf{5.35} & 2.92 & 0.51 \\
-Peak tok/s & \textbf{5.86} & 3.23 & 0.54 \\
+Avg tok/s & \textbf{5.57$\pm$0.12} & 2.92 & 0.51 \\
+Peak tok/s & \textbf{5.80} & 3.23 & 0.54 \\
 I/O per layer (ms) & 3--6 & 6--10 & 28--65 \\
 GPU compute (ms) & 0.54 & 1.50 & 1.75 \\
 \bottomrule
@@ -466,7 +471,7 @@ Beyond raw inference speed, the engine provides:
 
 \subsection{VRAM as the Dominant Factor}
 
-Our multi-hardware benchmarks reveal that VRAM capacity matters more than SSD speed, system RAM, or GPU compute power for MoE expert streaming. The RTX~3060 with 755\,GB RAM and 9\,GB/s NVMe achieves only 2.92~tok/s---below the RTX~4090 with 64\,GB RAM and 7\,GB/s NVMe at 5.35~tok/s. The 3$\times$ difference in VRAM cache capacity (2565 vs.\ 840 slots) dominates all other factors.
+Our multi-hardware benchmarks reveal that VRAM capacity matters more than SSD speed, system RAM, or GPU compute power for MoE expert streaming. The RTX~3060 with 755\,GB RAM and 9\,GB/s NVMe achieves only 2.92~tok/s, below the RTX~4090 with 64\,GB RAM and 7\,GB/s NVMe at 5.57~tok/s. The 3$\times$ difference in VRAM cache capacity (2565 vs.\ 840 slots) dominates all other factors.
 
 This suggests that future GPUs with larger VRAM (32--48\,GB) would provide disproportionate improvements for MoE inference, potentially caching 5000--7000 experts and pushing hit rates above 99\%.
 
@@ -476,12 +481,19 @@ Apple Silicon's unified memory provides higher streaming bandwidth (17.5\,GB/s) 
 
 \subsection{Applicability}
 
-The three-tier caching approach generalizes to any MoE model where experts dominate total parameters. DeepSeek-V3 (671B, 37B active) at 2-bit expert quantization would produce $\sim$200\,GB of expert data---within range of our streaming approach.
+The three-tier caching approach generalizes to any MoE model where experts dominate total parameters. DeepSeek-V3~\cite{deepseekv3} (671B, 37B active) at 2-bit expert quantization would produce $\sim$200\,GB of expert data---within range of our streaming approach. The architecture-agnostic design (compile-time configuration via model manifest) has been validated on Qwen3.5-397B; adapting to Mixtral~\cite{mixtral} or other MoE models requires only re-running the weight extraction and repacking pipeline.
+
+\subsection{Limitations}
+
+Our evaluation has several limitations. First, all benchmarks use single-request inference with greedy decoding; batched serving (multiple concurrent users) would require a different caching strategy, as each request's expert working set competes for VRAM cache slots. Second, the VRAM cache warm-up period (3--8 requests) means the system is 2$\times$ slower for one-shot use cases compared to sustained generation. Third, our frequency-weighted LRU policy uses a fixed $W=10$ that, while robust across tested workloads (Section~\ref{sec:cache}), has not been evaluated on models with fundamentally different routing patterns (e.g., models with fewer but larger experts). Fourth, the RTX~2080\,Ti benchmark uses virtualized storage, limiting its comparability with the NVMe-equipped systems. Finally, all measurements are single-system; we have not evaluated multi-GPU configurations where expert data could be partitioned across devices, potentially eliminating the I/O bottleneck entirely.
 
 % ============================================================================
 \section{Conclusion}
 
-We demonstrate that Mixture-of-Experts models exceeding 4$\times$ DRAM capacity can run at interactive speeds on commodity NVIDIA GPUs through a three-tier expert caching hierarchy. The key insight is that discrete GPU memory, while a liability for streaming, becomes an asset when used as a high-bandwidth expert cache. On RTX~4090, our system achieves 5.35~tok/s sustained (5.86~peak) on Qwen3.5-397B-A17B---23\% faster than the original Apple Silicon implementation---using only 16\,GB of system RAM. The complete engine is two source files totaling $\sim$2500 lines of CUDA/C, with no framework dependencies.
+We demonstrate that Mixture-of-Experts models exceeding 4$\times$ DRAM capacity can run at interactive speeds on commodity NVIDIA GPUs through a three-tier expert caching hierarchy. The key insight is that discrete GPU memory, while a liability for streaming, becomes an asset when used as a high-bandwidth expert cache. On RTX~4090, our system achieves $5.57 \pm 0.12$~tok/s sustained on Qwen3.5-397B-A17B---28\% faster than the original Apple Silicon implementation---using only 16\,GB of system RAM. The complete engine is two source files totaling $\sim$2500 lines of CUDA/C, with no framework dependencies.
+
+% ============================================================================
+\paragraph{AI Disclosure.} This paper was co-authored with Claude Opus 4.6 (Anthropic), which implemented the CUDA inference engine, kernel optimizations, and server infrastructure through interactive pair-programming sessions directed by the first author. Claude also assisted with drafting and revising sections of this manuscript. All experimental design, measurements, and analysis were conducted by the first author.
 
 % ============================================================================
 \bibliographystyle{IEEEtran}
