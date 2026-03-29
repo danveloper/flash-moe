@@ -2,20 +2,15 @@
 """Repack expert weights from scattered safetensors into contiguous per-layer binary files.
 
 Creates one binary file per layer: packed_experts/layer_XX.bin
-Each file = 512 experts x 7,077,888 bytes = ~3.63 GB
-Expert E starts at byte offset E * 7,077,888
+Expert E starts at byte offset E * EXPERT_SIZE.
 
-Within each expert block, 9 components packed in fixed order:
-  gate_proj.weight, gate_proj.scales, gate_proj.biases,
-  up_proj.weight,   up_proj.scales,   up_proj.biases,
-  down_proj.weight,  down_proj.scales,  down_proj.biases
+Component order within each expert: gate(W,S,B), up(W,S,B), down(W,S,B).
+Sizes are auto-detected from expert_index.json — works for any MoE model.
 
 Usage:
-    python repack_experts.py                    # repack all 60 layers
-    python repack_experts.py --layers 0-4       # repack layers 0-4
-    python repack_experts.py --layers 0,5,10    # repack specific layers
-    python repack_experts.py --dry-run           # verify without writing
-    python repack_experts.py --verify-only 0     # verify layer 0 against originals
+    python repack_experts.py --index expert_index.json       # repack all layers
+    python repack_experts.py --index expert_index.json --layers 0-4
+    python repack_experts.py --index expert_index.json --dry-run
 """
 
 import argparse
@@ -24,23 +19,19 @@ import os
 import time
 import sys
 
-# Component order and expected sizes
-COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
+# Component names in packing order
+COMPONENT_NAMES = [
+    "gate_proj.weight", "gate_proj.scales", "gate_proj.biases",
+    "up_proj.weight",   "up_proj.scales",   "up_proj.biases",
+    "down_proj.weight",  "down_proj.scales",  "down_proj.biases",
 ]
 
-EXPERT_SIZE = 7077888   # bytes per expert
-NUM_EXPERTS = 512
-NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+# These are auto-detected from the index
+COMPONENTS = []
+EXPERT_SIZE = 0
+NUM_EXPERTS = 0
+NUM_LAYERS = 0
+LAYER_SIZE = 0
 
 
 def parse_layers(spec):
@@ -59,19 +50,53 @@ def parse_layers(spec):
 
 
 def load_index(index_path):
-    """Load expert_index.json and return expert_reads dict + model_path."""
+    """Load expert_index.json, auto-detect model dimensions, return expert_reads + model_path."""
+    global COMPONENTS, EXPERT_SIZE, NUM_EXPERTS, NUM_LAYERS, LAYER_SIZE
+
     with open(index_path) as f:
         idx = json.load(f)
-    return idx['expert_reads'], idx['model_path']
+    expert_reads = idx['expert_reads']
+    model_path = idx['model_path']
+
+    # Auto-detect from first layer's component data
+    NUM_LAYERS = len(expert_reads)
+    first_layer = expert_reads[list(expert_reads.keys())[0]]
+
+    # Build COMPONENTS list with sizes from index
+    offset = 0
+    COMPONENTS = []
+    for comp_name in COMPONENT_NAMES:
+        if comp_name not in first_layer:
+            print(f"WARNING: component {comp_name} not found in index")
+            continue
+        info = first_layer[comp_name]
+        size = info['expert_size']
+        COMPONENTS.append({
+            "name": comp_name,
+            "offset": offset,
+            "size": size,
+            "shape": info.get('shape', []),
+        })
+        offset += size
+
+    EXPERT_SIZE = offset
+    NUM_EXPERTS = first_layer[COMPONENT_NAMES[0]]['shape'][0]
+    LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
+
+    print(f"[repack] Auto-detected: {NUM_LAYERS} layers, {NUM_EXPERTS} experts, "
+          f"expert_size={EXPERT_SIZE} bytes ({EXPERT_SIZE/1024/1024:.2f} MB)")
+    for c in COMPONENTS:
+        print(f"  {c['name']:25s} offset={c['offset']:>8d} size={c['size']:>8d}")
+
+    return expert_reads, model_path
 
 
 def verify_component_sizes(expert_reads):
-    """Verify that component sizes in the index match expected sizes."""
+    """Verify that component sizes in the index are consistent across layers."""
     expected = {c['name']: c['size'] for c in COMPONENTS}
     for layer_key, comps in expert_reads.items():
         for comp_name, info in comps.items():
             if comp_name not in expected:
-                print(f"WARNING: unknown component {comp_name} in layer {layer_key}")
                 continue
             if info['expert_size'] != expected[comp_name]:
                 print(f"MISMATCH: layer {layer_key}, {comp_name}: "
