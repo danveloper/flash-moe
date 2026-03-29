@@ -516,13 +516,15 @@ __global__ void rms_norm(
     uint32_t dim,
     float eps
 ) {
+    // Use float for warp reduction but accumulate per-thread in double
     __shared__ float shared[32];
-    float acc = 0.0f;
+    double acc_d = 0.0;
     for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
-        float v = x[i];
-        acc += v * v;
+        double v = (double)x[i];
+        acc_d += v * v;
     }
-    // Warp reduce
+    // Convert to float for warp reduction (small loss, but per-thread sum is precise)
+    float acc = (float)acc_d;
     acc = warp_reduce_sum(acc);
     uint32_t wid = threadIdx.x / 32;
     uint32_t lane = threadIdx.x % 32;
@@ -803,26 +805,35 @@ __global__ void l2_norm_qk(
     uint32_t base = head * key_dim;
 
     __shared__ float buf[128];
+    __shared__ float norm_scale;
 
-    // Q L2 norm: q = q / ||q||
+    // Q L2 norm: q = q / max(||q||, eps)  (matching ggml_compute_forward_l2_norm_f32)
     float qv = (tid < key_dim) ? q[base + tid] : 0.0f;
     buf[tid] = qv * qv;
     __syncthreads();
-    __shared__ float q_sum;
-    if (tid == 0) { float s = 0; for (uint32_t i = 0; i < key_dim; i++) s += buf[i]; q_sum = s; }
+    if (tid == 0) {
+        double s = 0.0;  // double precision matching ggml_float
+        for (uint32_t i = 0; i < key_dim; i++) s += (double)buf[i];
+        float sq = sqrtf((float)s);
+        norm_scale = 1.0f / fmaxf(sq, 1e-6f);
+    }
     __syncthreads();
     if (tid < key_dim)
-        q[base + tid] = qv * rsqrtf(q_sum + 1e-6f);
+        q[base + tid] = qv * norm_scale;
 
-    // K L2 norm: k = k / ||k||
+    // K L2 norm
     float kv = (tid < key_dim) ? k[base + tid] : 0.0f;
     buf[tid] = kv * kv;
     __syncthreads();
-    __shared__ float k_sum;
-    if (tid == 0) { float s = 0; for (uint32_t i = 0; i < key_dim; i++) s += buf[i]; k_sum = s; }
+    if (tid == 0) {
+        double s = 0.0;
+        for (uint32_t i = 0; i < key_dim; i++) s += (double)buf[i];
+        float sq = sqrtf((float)s);
+        norm_scale = 1.0f / fmaxf(sq, 1e-6f);
+    }
     __syncthreads();
     if (tid < key_dim)
-        k[base + tid] = kv * rsqrtf(k_sum + 1e-6f);
+        k[base + tid] = kv * norm_scale;
 }
 
 // ============================================================================
