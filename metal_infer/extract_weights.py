@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-extract_weights.py — Extract all non-expert weights from Qwen3.5-397B-A17B-4bit
+extract_weights.py — Extract all non-expert weights from any Qwen3.5 MoE model
 into a single binary file that the C inference engine can mmap.
 
 Outputs:
@@ -39,11 +39,8 @@ def parse_safetensors_header(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
-    parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
-                            '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
-                            '/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3'),
-                        help='Path to model directory')
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to model directory (safetensors)')
     parser.add_argument('--output', type=str, default='.',
                         help='Output directory for model_weights.bin and .json')
     parser.add_argument('--include-experts', action='store_true',
@@ -115,43 +112,60 @@ def main():
         san_name = sanitize_name(name)
         all_tensors.append((san_name, name, tensors_to_extract[name]))
 
+    # Read model config from config.json (auto-detect text_config nesting for VL models)
+    config_path = model_path / 'config.json'
+    if config_path.exists():
+        with open(config_path) as f:
+            raw_config = json.load(f)
+        # VL models nest the text config under "text_config"
+        cfg = raw_config.get('text_config', raw_config)
+        print(f"Config: {config_path} (text_config={'text_config' in raw_config})")
+    else:
+        print(f"WARNING: {config_path} not found, using defaults for Qwen3.5-397B")
+        cfg = {}
+
+    num_layers = cfg.get('num_hidden_layers', 60)
+    full_attn_interval = cfg.get('full_attention_interval', 4)
+
     # Write binary file
     bin_path = output_dir / 'model_weights.bin'
     manifest = {
         "model": str(model_path),
         "num_tensors": len(all_tensors),
         "tensors": {},
-        # Model config for the C engine
+        # Model config for the C engine — auto-detected from config.json
         "config": {
-            "hidden_size": 4096,
-            "num_hidden_layers": 60,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
-            "rms_norm_eps": 1e-6,
-            "num_experts": 512,
-            "num_experts_per_tok": 10,
-            "moe_intermediate_size": 1024,
-            "shared_expert_intermediate_size": 1024,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 64,
-            "linear_num_key_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "partial_rotary_factor": 0.25,
-            "rope_theta": 10000000.0,
+            "hidden_size": cfg.get('hidden_size', 4096),
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": cfg.get('num_attention_heads', 32),
+            "num_key_value_heads": cfg.get('num_key_value_heads', 2),
+            "head_dim": cfg.get('head_dim', 256),
+            "vocab_size": cfg.get('vocab_size', 248320),
+            "rms_norm_eps": cfg.get('rms_norm_eps', 1e-6),
+            "num_experts": cfg.get('num_experts', 512),
+            "num_experts_per_tok": cfg.get('num_experts_per_tok', 4),
+            "moe_intermediate_size": cfg.get('moe_intermediate_size', 1024),
+            "shared_expert_intermediate_size": cfg.get('shared_expert_intermediate_size', 1024),
+            "full_attention_interval": full_attn_interval,
+            "linear_num_value_heads": cfg.get('linear_num_value_heads', 64),
+            "linear_num_key_heads": cfg.get('linear_num_key_heads', 16),
+            "linear_key_head_dim": cfg.get('linear_key_head_dim', 128),
+            "linear_value_head_dim": cfg.get('linear_value_head_dim', 128),
+            "linear_conv_kernel_dim": cfg.get('linear_conv_kernel_dim', 4),
+            "partial_rotary_factor": cfg.get('partial_rotary_factor', 0.25),
+            "rope_theta": cfg.get('rope_theta', 10000000.0),
         }
     }
 
-    # Layer type map
-    layer_types = []
-    for i in range(60):
-        if (i + 1) % 4 == 0:
-            layer_types.append("full_attention")
-        else:
-            layer_types.append("linear_attention")
+    # Layer type map — auto-generated from config
+    layer_types = cfg.get('layer_types', None)
+    if layer_types is None:
+        layer_types = []
+        for i in range(num_layers):
+            if (i + 1) % full_attn_interval == 0:
+                layer_types.append("full_attention")
+            else:
+                layer_types.append("linear_attention")
     manifest["config"]["layer_types"] = layer_types
 
     print(f"\nWriting {bin_path}...")

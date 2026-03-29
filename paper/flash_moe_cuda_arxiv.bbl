@@ -1,0 +1,102 @@
+\begin{thebibliography}{16}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[4.6 \& Woods(2026)4.6 and Woods]{flashmoe}
+C.~Opus 4.6 and D.~Woods.
+\newblock Flash-{MoE}: Streaming a 397{B} parameter mixture-of-experts model
+  from {NVMe} at 5.7 tokens/second on consumer hardware.
+\newblock 2026.
+\newblock
+  \url{https://github.com/danveloper/flash-moe/blob/main/paper/flash_moe.pdf}.
+
+\bibitem[Alizadeh et~al.(2023)]{llminflash}
+K.~Alizadeh et~al.
+\newblock {LLM} in a flash: Efficient large language model inference with
+  limited memory.
+\newblock \emph{arXiv preprint arXiv:2312.11514}, 2023.
+
+\bibitem[Cao et~al.(2025)]{moelightning}
+S.~Cao et~al.
+\newblock {MoE-Lightning}: High-throughput {MoE} inference on
+  memory-constrained {GPUs}.
+\newblock In \emph{Proceedings of ASPLOS}, 2025.
+
+\bibitem[Chen et~al.(2025)]{ktransformers}
+Y.~Chen et~al.
+\newblock {KTransformers}: Unleashing the full potential of {CPU}/{GPU} hybrid
+  inference for {MoE} models.
+\newblock In \emph{Proceedings of SOSP}, 2025.
+
+\bibitem[{DeepSeek-AI}(2024)]{deepseekv3}
+{DeepSeek-AI}.
+\newblock {DeepSeek-V3} technical report.
+\newblock \emph{arXiv preprint arXiv:2412.19437}, 2024.
+
+\bibitem[Hwang et~al.(2024)]{pregated}
+D.~Hwang et~al.
+\newblock Pre-gated {MoE}: An algorithm-system co-design for fast and scalable
+  mixture-of-expert inference.
+\newblock \emph{arXiv preprint arXiv:2308.12066}, 2024.
+
+\bibitem[Jiang et~al.(2024)]{mixtral}
+A.~Jiang et~al.
+\newblock Mixtral of experts.
+\newblock \emph{arXiv preprint arXiv:2401.04088}, 2024.
+
+\bibitem[Lee et~al.(2001)]{lrfu}
+D.~Lee et~al.
+\newblock {LRFU}: A spectrum of policies that subsumes the least recently used
+  and least frequently used policies.
+\newblock \emph{IEEE Transactions on Computers}, 50\penalty0 (12):\penalty0
+  1352--1360, 2001.
+
+\bibitem[Li et~al.(2025)]{moegen}
+Y.~Li et~al.
+\newblock {MoE-Gen}: High-throughput {MoE} inference on a single {GPU} with
+  module-based batching.
+\newblock \emph{arXiv preprint arXiv:2503.09716}, 2025.
+
+\bibitem[Megiddo \& Modha(2003)Megiddo and Modha]{arc}
+N.~Megiddo and D.~S. Modha.
+\newblock {ARC}: A self-tuning, low overhead replacement cache.
+\newblock In \emph{Proceedings of FAST}, 2003.
+
+\bibitem[{NVIDIA}(2024)]{gds}
+{NVIDIA}.
+\newblock {GPUDirect} storage: A direct path between storage and {GPU} memory,
+  2024.
+\newblock \url{https://docs.nvidia.com/gpudirect-storage/}.
+
+\bibitem[Park et~al.(2025)]{floe}
+J.~Park et~al.
+\newblock {FloE}: On-the-fly {MoE} inference on memory-constrained {GPU}.
+\newblock In \emph{OpenReview}, 2025.
+
+\bibitem[Rajbhandari et~al.(2022)]{deepspeedmoe}
+S.~Rajbhandari et~al.
+\newblock {DeepSpeed-MoE}: Advancing mixture-of-experts inference and training
+  to power next-generation {AI} scale.
+\newblock In \emph{Proceedings of ICML}, 2022.
+
+\bibitem[Sheng et~al.(2023)]{flexgen}
+Y.~Sheng et~al.
+\newblock {FlexGen}: High-throughput generative inference of large language
+  models with a single {GPU}.
+\newblock In \emph{Proceedings of ICML}, 2023.
+
+\bibitem[Sheng et~al.(2024)]{slora}
+Y.~Sheng et~al.
+\newblock {S-LoRA}: Serving thousands of concurrent {LoRA} adapters.
+\newblock In \emph{Proceedings of MLSys}, 2024.
+
+\bibitem[Song et~al.(2024)]{powerinfer}
+Y.~Song et~al.
+\newblock {PowerInfer}: Fast large language model serving with a consumer-grade
+  {GPU}.
+\newblock In \emph{Proceedings of SOSP}, 2024.
+
+\end{thebibliography}
