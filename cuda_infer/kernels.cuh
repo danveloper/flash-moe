@@ -264,7 +264,8 @@ __global__ void dequant_matvec_q4k(
         q8_scales[bi] = scale;
         for (uint32_t i = 0; i < 256; i++) {
             float v = x_shared[bi * 256 + i] * inv_scale;
-            int q = __float2int_rn(v);
+            // lroundf: round ties away from zero (matching ggml quantize_row_q8_K)
+            int q = (int)(v >= 0 ? (v + 0.5f) : (v - 0.5f));
             q8_shared[bi * 256 + i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
         }
     }
@@ -317,17 +318,19 @@ __global__ void dequant_matvec_q4k(
             sumi += bsum * (int)mins[j / 2];
         }
 
-        // Integer dot product (matching vec_dot inner loop)
-        int32_t aux32 = 0;
-        int ai = 0, is = 0;
+        // Integer dot product with 8 accumulators (matching vec_dot_qX_K_q8_K exactly)
+        int32_t aux32[8] = {0,0,0,0,0,0,0,0};
+        int ai = 0, is_idx = 0;
         for (int j = 0; j < 8; j++) {
-            int sc = scales[is++];
-            for (int l = 0; l < 32; l++)
-                aux32 += sc * (int)q8[ai + l] * (int)aux8[ai + l];
-            ai += 32;
+            int32_t sc = scales[is_idx++];
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
         }
-
-        acc += d_w * d_q8 * (float)aux32 - dmin_w * d_q8 * (float)sumi;
+        float d_combined = d_w * d_q8;
+        for (int l = 0; l < 8; l++) acc += d_combined * (float)aux32[l];
+        acc -= dmin_w * d_q8 * (float)sumi;
     }
 
     acc = warp_reduce_sum(acc);
@@ -397,7 +400,8 @@ __global__ void dequant_matvec_q5k(
         q8_scales[bi] = scale;
         for (uint32_t i = 0; i < 256; i++) {
             float v = x_shared[bi * 256 + i] * inv_scale;
-            int q = __float2int_rn(v);
+            // lroundf: round ties away from zero (matching ggml quantize_row_q8_K)
+            int q = (int)(v >= 0 ? (v + 0.5f) : (v - 0.5f));
             q8_shared[bi * 256 + i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
         }
     }
@@ -453,17 +457,19 @@ __global__ void dequant_matvec_q5k(
             sumi += bsum * (int)mins[j / 2];
         }
 
-        // Integer dot product (matching vec_dot inner loop)
-        int32_t aux32 = 0;
-        int ai = 0, is = 0;
+        // Integer dot product with 8 accumulators (matching vec_dot_qX_K_q8_K exactly)
+        int32_t aux32[8] = {0,0,0,0,0,0,0,0};
+        int ai = 0, is_idx = 0;
         for (int j = 0; j < 8; j++) {
-            int sc = scales[is++];
-            for (int l = 0; l < 32; l++)
-                aux32 += sc * (int)q8[ai + l] * (int)aux8[ai + l];
-            ai += 32;
+            int32_t sc = scales[is_idx++];
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
+            for (int l = 0; l < 8; l++) aux32[l] += sc * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
         }
-
-        acc += d_w * d_q8 * (float)aux32 - dmin_w * d_q8 * (float)sumi;
+        float d_combined = d_w * d_q8;
+        for (int l = 0; l < 8; l++) acc += d_combined * (float)aux32[l];
+        acc -= dmin_w * d_q8 * (float)sumi;
     }
 
     acc = warp_reduce_sum(acc);
@@ -1012,7 +1018,8 @@ __global__ void dequant_matvec_q6k(
         q8_scales[bi] = scale;
         for (uint32_t i = 0; i < 256; i++) {
             float v = x_shared[bi * 256 + i] * inv_scale;
-            int q = __float2int_rn(v);
+            // lroundf: round ties away from zero (matching ggml quantize_row_q8_K)
+            int q = (int)(v >= 0 ? (v + 0.5f) : (v - 0.5f));
             q8_shared[bi * 256 + i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
         }
     }
@@ -1056,18 +1063,16 @@ __global__ void dequant_matvec_q6k(
             }
         }
 
-        // Integer dot product (matching vec_dot_q6_K_q8_K inner loop)
-        // 16 sub-blocks of 16 elements, each with int8 scale
-        int32_t aux32 = 0;
-        int ai = 0, is = 0;
+        // Integer dot product with 8 accumulators (matching vec_dot_q6_K_q8_K)
+        int32_t aux32[8] = {0,0,0,0,0,0,0,0};
+        int ai = 0, is_q6 = 0;
         for (int j = 0; j < 16; j++) {
-            int scale = sc[is++];
-            for (int l = 0; l < 16; l++)
-                aux32 += scale * (int)q8[ai + l] * (int)aux8[ai + l];
-            ai += 16;
+            int32_t scale = sc[is_q6++];
+            for (int l = 0; l < 8; l++) aux32[l] += scale * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
+            for (int l = 0; l < 8; l++) aux32[l] += scale * (int)q8[ai+l] * (int)aux8[ai+l]; ai += 8;
         }
-
-        acc += d_w * d_q8 * (float)aux32;
+        float d_combined = d_w * d_q8;
+        for (int l = 0; l < 8; l++) acc += d_combined * (float)aux32[l];
     }
 
     acc = warp_reduce_sum(acc);

@@ -1776,8 +1776,13 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             LINEAR_VALUE_DIM, RMS_NORM_EPS);
 
         if (layer_idx == 0 && g_dump_layer0) {
-            float d5[5];
+            float d5[5]; float outlier;
             CHECK_CUDA(cudaDeviceSynchronize());
+            // Check the outlier element (raw QKV[4156] and conv[4156])
+            CHECK_CUDA(cudaMemcpy(&outlier, model->buf_q_proj + 4156, sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 raw_QKV[4156] = %.6f\n", outlier);
+            CHECK_CUDA(cudaMemcpy(&outlier, model->buf_conv_output + 4156, sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 conv[4156] = %.6f\n", outlier);
             CHECK_CUDA(cudaMemcpy(d5, model->buf_attn_out, 5*sizeof(float), cudaMemcpyDeviceToHost));
             printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "gated_norm", d5[0],d5[1],d5[2],d5[3],d5[4]);
             // Save full gated_norm for comparison
