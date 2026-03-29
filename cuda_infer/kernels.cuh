@@ -27,6 +27,7 @@
 
 #pragma once
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 
 #define GROUP_SIZE 64
@@ -329,6 +330,127 @@ static inline void launch_dequant_matvec_q4k(
     dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
     size_t smem = in_dim * sizeof(float);
     dequant_matvec_q4k<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
+}
+
+// ============================================================================
+// Q5_K dequantized matrix-vector multiply (GGML format)
+// ============================================================================
+// Q5_K block (176 bytes per 256 elements, 5.5 bits/weight):
+//   d (fp16): super-block scale
+//   dmin (fp16): super-block min scale
+//   scales[12]: packed 6-bit per-sub-block scales and mins (same as Q4_K)
+//   qh[32]: high bits (5th bit) for each of 256 elements, packed 8 per byte
+//   qs[128]: low 4 bits, packed 2 per byte (same as Q4_K)
+// Dequant: value = d * sub_scale * q5_value - dmin * sub_min
+//   where q5_value = (low_nibble) | (high_bit << 4), range 0-31
+
+#define Q5_K_BLOCK_SIZE 176  // 2+2+12+32+128 bytes
+
+__global__ void dequant_matvec_q5k(
+    const uint8_t* __restrict__ W_q5k,
+    const float*   __restrict__ x,
+    float*         __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    extern __shared__ float x_shared[];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const uint32_t blocks_per_row = in_dim >> 8;
+
+    const uint32_t tid = warp_id * 32 + lane;
+    for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
+        x_shared[i] = x[i];
+    __syncthreads();
+
+    if (row >= out_dim) return;
+
+    const uint8_t *row_data = W_q5k + (size_t)row * blocks_per_row * Q5_K_BLOCK_SIZE;
+    float acc = 0.0f;
+
+    for (uint32_t bi = lane; bi < blocks_per_row; bi += 32) {
+        const uint8_t *block = row_data + bi * Q5_K_BLOCK_SIZE;
+
+        float d    = __half2float(__ldg((const __half *)(block)));
+        float dmin = __half2float(__ldg((const __half *)(block + 2)));
+        const uint8_t *sc_ptr = block + 4;    // 12 bytes scales
+        const uint8_t *qh = block + 16;       // 32 bytes high bits
+        const uint32_t *qs32 = (const uint32_t *)(block + 48);  // 128 bytes = 32 uint32
+
+        uint32_t x_base = bi << 8;
+
+        // Precompute scale/min pairs (same packing as Q4_K)
+        float d1[8], m1[8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            d1[j] = d * (float)(sc_ptr[j] & 63);
+            m1[j] = dmin * (float)(sc_ptr[j + 4] & 63);
+        }
+        #pragma unroll
+        for (int j = 4; j < 8; j++) {
+            d1[j] = d * (float)((sc_ptr[j + 4] & 0xF) | ((sc_ptr[j - 4] >> 6) << 4));
+            m1[j] = dmin * (float)((sc_ptr[j + 4] >> 4) | ((sc_ptr[j] >> 6) << 4));
+        }
+
+        // Process 8 sub-blocks of 32 elements
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float ds = d1[j];
+            float ms = m1[j];
+            uint32_t xb = x_base + (j << 5);
+            uint32_t qs_off = j << 2;
+            // High-bit byte for this sub-block: qh[j*4 .. j*4+3]
+            uint32_t qh_word = __ldg((const uint32_t *)(qh + j * 4));
+
+            uint32_t q0 = __ldg(qs32 + qs_off);
+            uint32_t q1 = __ldg(qs32 + qs_off + 1);
+            uint32_t q2 = __ldg(qs32 + qs_off + 2);
+            uint32_t q3 = __ldg(qs32 + qs_off + 3);
+
+            // Low nibbles (first 16 elements)
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
+                uint32_t xi = xb + b * 4;
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    uint32_t elem_idx = b * 4 + k;
+                    uint32_t lo = (qw >> (k * 8)) & 0xF;
+                    uint32_t hi = (qh_word >> elem_idx) & 1;
+                    float val = (float)(lo | (hi << 4));
+                    acc += __fmaf_rn(val, ds * x_shared[xi + k], -ms * x_shared[xi + k]);
+                }
+            }
+            // High nibbles (next 16 elements)
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
+                uint32_t xi = xb + 16 + b * 4;
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    uint32_t elem_idx = 16 + b * 4 + k;
+                    uint32_t lo = (qw >> (k * 8 + 4)) & 0xF;
+                    uint32_t hi = (qh_word >> elem_idx) & 1;
+                    float val = (float)(lo | (hi << 4));
+                    acc += __fmaf_rn(val, ds * x_shared[xi + k], -ms * x_shared[xi + k]);
+                }
+            }
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+static inline void launch_dequant_matvec_q5k(
+    const uint8_t* W, const float* x, float* out,
+    uint32_t out_dim, uint32_t in_dim, cudaStream_t stream = 0
+) {
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    size_t smem = in_dim * sizeof(float);
+    dequant_matvec_q5k<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
 }
 
 // ============================================================================
@@ -758,6 +880,180 @@ static inline void launch_dequant_matvec(
     dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
     size_t smem = in_dim * sizeof(float);
     dequant_matvec_4bit_fma_vec4<<<grid, block, smem, stream>>>(W, scales, biases, x, out, out_dim, in_dim);
+}
+
+// ============================================================================
+// Q6_K dequantized matrix-vector multiply (GGML format)
+// ============================================================================
+// Q6_K block (210 bytes per 256 elements, 6.5625 bits/weight):
+//   ql[128]: low 4 bits of each 6-bit value (2 per byte, low nibble first)
+//   qh[64]:  high 2 bits of each 6-bit value (4 values per byte)
+//   scales[16]: int8 per-sub-block scales (16 sub-blocks of 16 elements)
+//   d (fp16): super-block scale
+// Dequant: value = d * scale * (q6_value - 32)  where q6_value is 0-63 (6-bit unsigned)
+
+#define Q6_K_BLOCK_SIZE 210  // 128+64+16+2 bytes
+
+__global__ void dequant_matvec_q6k(
+    const uint8_t* __restrict__ W_q6k,
+    const float*   __restrict__ x,
+    float*         __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    extern __shared__ float x_shared[];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const uint32_t blocks_per_row = in_dim >> 8;  // in_dim / 256
+
+    const uint32_t tid = warp_id * 32 + lane;
+    for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
+        x_shared[i] = x[i];
+    __syncthreads();
+
+    if (row >= out_dim) return;
+
+    const uint8_t *row_data = W_q6k + (size_t)row * blocks_per_row * Q6_K_BLOCK_SIZE;
+    float acc = 0.0f;
+
+    for (uint32_t bi = lane; bi < blocks_per_row; bi += 32) {
+        const uint8_t *block = row_data + bi * Q6_K_BLOCK_SIZE;
+
+        const uint8_t *ql = block;            // 128 bytes: low 4 bits
+        const uint8_t *qh = block + 128;      // 64 bytes: high 2 bits
+        const int8_t *scales = (const int8_t *)(block + 192);  // 16 bytes
+        float d = __half2float(__ldg((const __half *)(block + 208)));
+
+        uint32_t x_base = bi << 8;  // bi * 256
+
+        // 256 elements in 16 sub-blocks of 16
+        // ql layout: elements 0-127 use ql[0-127] low nibbles, elements 128-255 use high nibbles
+        // qh layout: 4 groups of 64, each qh byte holds 2 bits for 4 elements
+
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            float sc = d * (float)scales[j];
+            uint32_t base_idx = j * 16;
+            uint32_t xi = x_base + base_idx;
+
+            #pragma unroll
+            for (int k = 0; k < 16; k++) {
+                uint32_t elem = base_idx + k;
+                // Reconstruct 6-bit value
+                uint8_t ql_byte, ql_shift, qh_byte, qh_shift;
+                int q6;
+
+                if (elem < 128) {
+                    // Low half: ql[elem/2] low or high nibble
+                    ql_byte = __ldg(&ql[elem / 2]);
+                    ql_shift = (elem & 1) ? 4 : 0;
+                    // qh: qh[elem/4] bits ((elem%4)*2)..((elem%4)*2+1)
+                    qh_byte = __ldg(&qh[elem / 4]);
+                    qh_shift = (elem & 3) * 2;
+                } else {
+                    uint32_t e2 = elem - 128;
+                    ql_byte = __ldg(&ql[64 + e2 / 2]);
+                    ql_shift = (e2 & 1) ? 4 : 0;
+                    qh_byte = __ldg(&qh[32 + e2 / 4]);
+                    qh_shift = (e2 & 3) * 2;
+                }
+
+                q6 = ((ql_byte >> ql_shift) & 0xF) | (((qh_byte >> qh_shift) & 3) << 4);
+                acc += sc * (float)(q6 - 32) * x_shared[xi + k];
+            }
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+static inline void launch_dequant_matvec_q6k(
+    const uint8_t* W, const float* x, float* out,
+    uint32_t out_dim, uint32_t in_dim, cudaStream_t stream = 0
+) {
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    size_t smem = in_dim * sizeof(float);
+    dequant_matvec_q6k<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
+}
+
+// ============================================================================
+// F32 matrix-vector multiply (for unquantized weights like norms, small tensors)
+// ============================================================================
+
+__global__ void matvec_f32(
+    const float* __restrict__ W,
+    const float* __restrict__ x,
+    float*       __restrict__ out,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    extern __shared__ float x_shared[];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+
+    const uint32_t tid = warp_id * 32 + lane;
+    for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
+        x_shared[i] = x[i];
+    __syncthreads();
+
+    if (row >= out_dim) return;
+
+    const float *row_data = W + (size_t)row * in_dim;
+    float acc = 0.0f;
+
+    for (uint32_t i = lane; i < in_dim; i += 32)
+        acc += row_data[i] * x_shared[i];
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+static inline void launch_matvec_f32(
+    const float* W, const float* x, float* out,
+    uint32_t out_dim, uint32_t in_dim, cudaStream_t stream = 0
+) {
+    dim3 block(32, ROWS_PER_BLOCK);
+    dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    size_t smem = in_dim * sizeof(float);
+    matvec_f32<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
+}
+
+// ============================================================================
+// Format-aware matvec dispatch for GGUF support
+// ============================================================================
+// GGML quant type IDs (from ggml-common.h)
+#define GGUF_TYPE_F32   0
+#define GGUF_TYPE_F16   1
+#define GGUF_TYPE_Q4_K  12
+#define GGUF_TYPE_Q5_K  13
+#define GGUF_TYPE_Q6_K  14
+
+static inline void launch_dequant_matvec_gguf(
+    const void* W, const float* x, float* out,
+    uint32_t out_dim, uint32_t in_dim, int gguf_type, cudaStream_t stream = 0
+) {
+    switch (gguf_type) {
+        case GGUF_TYPE_Q4_K:
+            launch_dequant_matvec_q4k((const uint8_t*)W, x, out, out_dim, in_dim, stream);
+            break;
+        case GGUF_TYPE_Q5_K:
+            launch_dequant_matvec_q5k((const uint8_t*)W, x, out, out_dim, in_dim, stream);
+            break;
+        case GGUF_TYPE_Q6_K:
+            launch_dequant_matvec_q6k((const uint8_t*)W, x, out, out_dim, in_dim, stream);
+            break;
+        case GGUF_TYPE_F32:
+            launch_matvec_f32((const float*)W, x, out, out_dim, in_dim, stream);
+            break;
+        default:
+            // Unsupported type — fall back to Q4_K as best guess
+            launch_dequant_matvec_q4k((const uint8_t*)W, x, out, out_dim, in_dim, stream);
+            break;
+    }
 }
 
 static inline void launch_swiglu(const float* gate, const float* up, float* out, uint32_t dim, cudaStream_t s = 0) {

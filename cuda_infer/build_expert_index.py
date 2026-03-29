@@ -39,9 +39,10 @@ def main():
     weight_map = idx['weight_map']
 
     # Find all expert weight tensor names
-    # Pattern: language_model.model.layers.{L}.mlp.switch_mlp.{gate_proj|up_proj|down_proj}.{weight|scales|biases}
+    # Matches both "language_model.model.layers.{L}.mlp.switch_mlp.{proj}.{comp}"
+    # and "model.layers.{L}.mlp.switch_mlp.{proj}.{comp}" (no language_model prefix)
     expert_pattern = re.compile(
-        r'language_model\.model\.layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$'
+        r'(?:language_model\.)?model\.layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$'
     )
 
     # Group by (layer, proj.component) -> filename
@@ -140,27 +141,27 @@ def main():
     print(f"\nWrote {args.output}")
     print(f"  {len(layers)} layers, 9 components each")
 
-    # Verify sizes match expected layout
-    expected = {
-        'gate_proj.weight': 2097152,
-        'gate_proj.scales': 131072,
-        'gate_proj.biases': 131072,
-        'up_proj.weight': 2097152,
-        'up_proj.scales': 131072,
-        'up_proj.biases': 131072,
-        'down_proj.weight': 2097152,
-        'down_proj.scales': 131072,
-        'down_proj.biases': 131072,
-    }
+    # Verify sizes are consistent across layers
+    first_layer = expert_reads[str(layers[0])]
+    expert_size_total = sum(first_layer[c]['expert_size'] for c in first_layer)
+    num_experts = first_layer[list(first_layer.keys())[0]]['shape'][0]
+    print(f"  Experts per layer: {num_experts}")
+    print(f"  Expert size: {expert_size_total} bytes ({expert_size_total/1024/1024:.2f} MB)")
+    for comp, info in first_layer.items():
+        print(f"    {comp:25s} {info['expert_size']:>8d} bytes  shape={info['shape']}")
+
     ok = True
-    for layer in layers[:1]:  # check first layer
-        for comp, exp_size in expected.items():
-            actual = expert_reads[str(layer)][comp]['expert_size']
-            if actual != exp_size:
-                print(f"  MISMATCH: layer {layer} {comp}: {actual} != {exp_size}")
+    for layer in layers[1:]:
+        for comp in first_layer:
+            if comp not in expert_reads[str(layer)]:
+                print(f"  MISSING: layer {layer} {comp}")
+                ok = False
+                continue
+            if expert_reads[str(layer)][comp]['expert_size'] != first_layer[comp]['expert_size']:
+                print(f"  MISMATCH: layer {layer} {comp}")
                 ok = False
     if ok:
-        print("  Size verification: OK")
+        print("  Cross-layer consistency: OK")
 
 
 if __name__ == '__main__':

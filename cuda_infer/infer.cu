@@ -117,6 +117,23 @@ extern "C" {
 #endif
 #define MAX_K               8
 
+// Quant format (0 = MLX affine 4-bit, 1 = GGUF)
+static int g_quant_format = 0;  // set at startup from manifest
+
+// Runtime expert size — defaults to compile-time MLX value, overridden for GGUF
+static size_t g_expert_size = EXPERT_SIZE;
+
+// GGUF expert component offsets and types (populated from layout.json for GGUF)
+static size_t g_gguf_gate_offset = 0;
+static size_t g_gguf_gate_size = 0;
+static int    g_gguf_gate_type = 12;  // Q4_K default
+static size_t g_gguf_up_offset = 0;
+static size_t g_gguf_up_size = 0;
+static int    g_gguf_up_type = 12;
+static size_t g_gguf_down_offset = 0;
+static size_t g_gguf_down_size = 0;
+static int    g_gguf_down_type = 14;  // Q6_K default
+
 #define CHECK_CUDA(call) do { \
     cudaError_t err = (call); \
     if (err != cudaSuccess) { \
@@ -237,6 +254,7 @@ typedef struct {
     char dtype[8];    // "U32", "BF16", "F32"
     int shape[4];
     int ndim;
+    int gguf_type;    // GGML quant type (0=F32, 12=Q4_K, 14=Q6_K, etc.) — only used for GGUF
 } TensorInfo;
 
 typedef struct {
@@ -345,6 +363,14 @@ static TensorManifest *load_manifest(const char *path) {
             }
         }
 
+        // Parse gguf_type (GGML quant type, only present for GGUF format)
+        t->gguf_type = 0;
+        char *gguf_key = strstr((char *)brace, "\"gguf_type\"");
+        if (gguf_key && gguf_key < next_brace) {
+            char *gcolon = strchr(gguf_key, ':');
+            if (gcolon) t->gguf_type = atoi(gcolon + 1);
+        }
+
         m->num_tensors++;
         p = next_brace;
     }
@@ -444,6 +470,25 @@ static int find_tensor_in_json(const char *name, size_t *out_offset, size_t *out
     return 1;
 }
 
+// Extended version that also extracts gguf_type
+static int find_tensor_gguf_type_in_json(const char *name) {
+    if (!g_manifest_json) return 0;
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", name);
+    const char *pos = strstr(g_manifest_json, pattern);
+    if (!pos) return 0;
+    const char *brace = strchr(pos + strlen(pattern), '{');
+    if (!brace) return 0;
+    const char *end_brace = strchr(brace, '}');
+    if (!end_brace) return 0;
+    const char *gt_key = strstr(brace, "\"gguf_type\"");
+    if (gt_key && gt_key < end_brace) {
+        const char *colon = strchr(gt_key, ':');
+        if (colon) return atoi(colon + 1);
+    }
+    return 0;
+}
+
 static void *get_tensor_ptr(WeightFile *wf, const char *name) {
     TensorInfo *t = find_tensor(wf, name);
     if (!t) return NULL;
@@ -486,13 +531,25 @@ typedef struct {
         uint32_t *sd_w;   uint16_t *sd_s, *sd_b;
         uint32_t *seg_w;  uint16_t *seg_s, *seg_b;  // shared_expert_gate
 
+        // Fused QKV for full attention in GGUF mode (separate Q/K/V for MLX)
+        uint32_t *full_qkv_w; uint16_t *full_qkv_s, *full_qkv_b;
+
         int is_full;
+
+        // GGUF quant types (populated at init, 0 for MLX)
+        int qt_q, qt_k, qt_v, qt_o;                    // full attention
+        int qt_qkv, qt_z, qt_b, qt_a, qt_out;          // linear attention
+        int qt_gate, qt_sg, qt_su, qt_sd, qt_seg;       // MoE
+        int qt_full_qkv;                                 // fused QKV for full attn (GGUF)
     } layers[NUM_LAYERS];
 
     // Global weights
     uint32_t *embed_w; uint16_t *embed_s, *embed_b;
     uint32_t *lm_head_w; uint16_t *lm_head_s, *lm_head_b;
     uint16_t *final_norm_w;
+
+    // GGUF quant types for global weights
+    int qt_embed, qt_lm_head;
 
     // Scratch buffers (GPU)
     float *buf_hidden;       // [HIDDEN_DIM]
@@ -624,6 +681,26 @@ static void *upload_tensor(WeightFile *wf, const char *name, void *d_base, size_
     model->layers[layer_idx].b_field = (uint16_t *)upload_tensor(wf, _n, model->d_weights, &off); \
 } while(0)
 
+// GGUF: single tensor per weight (no separate scales/biases)
+#define UPLOAD_WEIGHT_SINGLE(prefix, w_field) do { \
+    char _n[256]; \
+    snprintf(_n, sizeof(_n), "%s.weight", prefix); \
+    model->w_field = (uint32_t *)upload_tensor(wf, _n, model->d_weights, &off); \
+} while(0)
+
+#define UPLOAD_LAYER_SINGLE(layer_idx, prefix, w_field) do { \
+    char _n[256]; \
+    snprintf(_n, sizeof(_n), "model.layers.%d." prefix ".weight", layer_idx); \
+    model->layers[layer_idx].w_field = (uint32_t *)upload_tensor(wf, _n, model->d_weights, &off); \
+} while(0)
+
+// Helper to look up gguf_type for a tensor name
+static int lookup_gguf_type(WeightFile *wf, const char *name) {
+    TensorInfo *t = find_tensor(wf, name);
+    if (t) return t->gguf_type;
+    return find_tensor_gguf_type_in_json(name);
+}
+
 // ============================================================================
 // Model initialization
 // ============================================================================
@@ -641,49 +718,69 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
 
     size_t off = 0;
 
-    // Global weights
-    UPLOAD_WEIGHT_TRIPLET("model.embed_tokens", embed_w, embed_s, embed_b);
-    UPLOAD_WEIGHT_TRIPLET("lm_head", lm_head_w, lm_head_s, lm_head_b);
+    if (g_quant_format == 1) {
+        // ================================================================
+        // GGUF: single tensor per weight (no separate scales/biases)
+        // S and B pointers remain NULL (calloc'd to 0).
+        // ================================================================
+        UPLOAD_WEIGHT_SINGLE("model.embed_tokens", embed_w);
+        model->qt_embed = lookup_gguf_type(wf, "model.embed_tokens.weight");
+        UPLOAD_WEIGHT_SINGLE("lm_head", lm_head_w);
+        model->qt_lm_head = lookup_gguf_type(wf, "lm_head.weight");
 
-    {
-        char n[] = "model.norm.weight";
-        model->final_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
-    }
-
-    // Per-layer weights
-    for (int i = 0; i < NUM_LAYERS; i++) {
-        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
-        model->layers[i].is_full = is_full;
-
-        // Norms
         {
+            char n[] = "model.norm.weight";
+            model->final_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+        }
+
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+            model->layers[i].is_full = is_full;
             char n[256];
+
+            // Norms (always f32 or bf16 in GGUF — uploaded as raw data)
             snprintf(n, sizeof(n), "model.layers.%d.input_layernorm.weight", i);
             model->layers[i].input_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
             snprintf(n, sizeof(n), "model.layers.%d.post_attention_layernorm.weight", i);
             model->layers[i].post_attn_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
-        }
 
-        if (is_full) {
-            UPLOAD_LAYER_TRIPLET(i, "self_attn.q_proj", q_w, q_s, q_b);
-            UPLOAD_LAYER_TRIPLET(i, "self_attn.k_proj", k_w, k_s, k_b);
-            UPLOAD_LAYER_TRIPLET(i, "self_attn.v_proj", v_w, v_s, v_b);
-            UPLOAD_LAYER_TRIPLET(i, "self_attn.o_proj", o_w, o_s, o_b);
-            {
-                char n[256];
+            if (is_full) {
+                // GGUF full attention: separate Q/K/V (not fused)
+                UPLOAD_LAYER_SINGLE(i, "self_attn.q_proj", q_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.self_attn.q_proj.weight", i);
+                  model->layers[i].qt_q = lookup_gguf_type(wf, n); }
+                UPLOAD_LAYER_SINGLE(i, "self_attn.k_proj", k_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.self_attn.k_proj.weight", i);
+                  model->layers[i].qt_k = lookup_gguf_type(wf, n); }
+                UPLOAD_LAYER_SINGLE(i, "self_attn.v_proj", v_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.self_attn.v_proj.weight", i);
+                  model->layers[i].qt_v = lookup_gguf_type(wf, n); }
+                UPLOAD_LAYER_SINGLE(i, "self_attn.o_proj", o_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.self_attn.o_proj.weight", i);
+                  model->layers[i].qt_o = lookup_gguf_type(wf, n); }
+
+                // Q/K norms
                 snprintf(n, sizeof(n), "model.layers.%d.self_attn.q_norm.weight", i);
                 model->layers[i].q_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.self_attn.k_norm.weight", i);
                 model->layers[i].k_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
-            }
-        } else {
-            UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_qkv", qkv_w, qkv_s, qkv_b);
-            UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_z", z_w, z_s, z_b);
-            UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_b", b_w, b_s, b_b);
-            UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_a", a_w, a_s, a_b);
-            UPLOAD_LAYER_TRIPLET(i, "linear_attn.out_proj", out_proj_w, out_proj_s, out_proj_b);
-            {
-                char n[256];
+            } else {
+                UPLOAD_LAYER_SINGLE(i, "linear_attn.in_proj_qkv", qkv_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
+                  model->layers[i].qt_qkv = lookup_gguf_type(wf, n); }
+                UPLOAD_LAYER_SINGLE(i, "linear_attn.in_proj_z", z_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.linear_attn.in_proj_z.weight", i);
+                  model->layers[i].qt_z = lookup_gguf_type(wf, n); }
+                UPLOAD_LAYER_SINGLE(i, "linear_attn.in_proj_b", b_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.linear_attn.in_proj_b.weight", i);
+                  model->layers[i].qt_b = lookup_gguf_type(wf, n); }
+                UPLOAD_LAYER_SINGLE(i, "linear_attn.in_proj_a", a_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.linear_attn.in_proj_a.weight", i);
+                  model->layers[i].qt_a = lookup_gguf_type(wf, n); }
+                UPLOAD_LAYER_SINGLE(i, "linear_attn.out_proj", out_proj_w);
+                { snprintf(n, sizeof(n), "model.layers.%d.linear_attn.out_proj.weight", i);
+                  model->layers[i].qt_out = lookup_gguf_type(wf, n); }
+
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.conv1d.weight", i);
                 model->layers[i].conv1d_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.A_log", i);
@@ -693,14 +790,88 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.norm.weight", i);
                 model->layers[i].gated_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
             }
+
+            // MoE routing + shared expert (all layers)
+            UPLOAD_LAYER_SINGLE(i, "mlp.gate", gate_w);
+            { snprintf(n, sizeof(n), "model.layers.%d.mlp.gate.weight", i);
+              model->layers[i].qt_gate = lookup_gguf_type(wf, n); }
+            UPLOAD_LAYER_SINGLE(i, "mlp.shared_expert.gate_proj", sg_w);
+            { snprintf(n, sizeof(n), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
+              model->layers[i].qt_sg = lookup_gguf_type(wf, n); }
+            UPLOAD_LAYER_SINGLE(i, "mlp.shared_expert.up_proj", su_w);
+            { snprintf(n, sizeof(n), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
+              model->layers[i].qt_su = lookup_gguf_type(wf, n); }
+            UPLOAD_LAYER_SINGLE(i, "mlp.shared_expert.down_proj", sd_w);
+            { snprintf(n, sizeof(n), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
+              model->layers[i].qt_sd = lookup_gguf_type(wf, n); }
+            UPLOAD_LAYER_SINGLE(i, "mlp.shared_expert_gate", seg_w);
+            { snprintf(n, sizeof(n), "model.layers.%d.mlp.shared_expert_gate.weight", i);
+              model->layers[i].qt_seg = lookup_gguf_type(wf, n); }
+        }
+    } else {
+        // ================================================================
+        // MLX affine 4-bit: weight triplets (W, scales, biases)
+        // ================================================================
+        UPLOAD_WEIGHT_TRIPLET("model.embed_tokens", embed_w, embed_s, embed_b);
+        UPLOAD_WEIGHT_TRIPLET("lm_head", lm_head_w, lm_head_s, lm_head_b);
+
+        {
+            char n[] = "model.norm.weight";
+            model->final_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
         }
 
-        // MoE routing + shared expert (all layers)
-        UPLOAD_LAYER_TRIPLET(i, "mlp.gate", gate_w, gate_s, gate_b);
-        UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert.gate_proj", sg_w, sg_s, sg_b);
-        UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert.up_proj", su_w, su_s, su_b);
-        UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert.down_proj", sd_w, sd_s, sd_b);
-        UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert_gate", seg_w, seg_s, seg_b);
+        // Per-layer weights
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+            model->layers[i].is_full = is_full;
+
+            // Norms
+            {
+                char n[256];
+                snprintf(n, sizeof(n), "model.layers.%d.input_layernorm.weight", i);
+                model->layers[i].input_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                snprintf(n, sizeof(n), "model.layers.%d.post_attention_layernorm.weight", i);
+                model->layers[i].post_attn_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+            }
+
+            if (is_full) {
+                UPLOAD_LAYER_TRIPLET(i, "self_attn.q_proj", q_w, q_s, q_b);
+                UPLOAD_LAYER_TRIPLET(i, "self_attn.k_proj", k_w, k_s, k_b);
+                UPLOAD_LAYER_TRIPLET(i, "self_attn.v_proj", v_w, v_s, v_b);
+                UPLOAD_LAYER_TRIPLET(i, "self_attn.o_proj", o_w, o_s, o_b);
+                {
+                    char n[256];
+                    snprintf(n, sizeof(n), "model.layers.%d.self_attn.q_norm.weight", i);
+                    model->layers[i].q_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                    snprintf(n, sizeof(n), "model.layers.%d.self_attn.k_norm.weight", i);
+                    model->layers[i].k_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                }
+            } else {
+                UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_qkv", qkv_w, qkv_s, qkv_b);
+                UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_z", z_w, z_s, z_b);
+                UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_b", b_w, b_s, b_b);
+                UPLOAD_LAYER_TRIPLET(i, "linear_attn.in_proj_a", a_w, a_s, a_b);
+                UPLOAD_LAYER_TRIPLET(i, "linear_attn.out_proj", out_proj_w, out_proj_s, out_proj_b);
+                {
+                    char n[256];
+                    snprintf(n, sizeof(n), "model.layers.%d.linear_attn.conv1d.weight", i);
+                    model->layers[i].conv1d_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                    snprintf(n, sizeof(n), "model.layers.%d.linear_attn.A_log", i);
+                    model->layers[i].A_log = (float *)upload_tensor(wf, n, model->d_weights, &off);
+                    snprintf(n, sizeof(n), "model.layers.%d.linear_attn.dt_bias", i);
+                    model->layers[i].dt_bias = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                    snprintf(n, sizeof(n), "model.layers.%d.linear_attn.norm.weight", i);
+                    model->layers[i].gated_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                }
+            }
+
+            // MoE routing + shared expert (all layers)
+            UPLOAD_LAYER_TRIPLET(i, "mlp.gate", gate_w, gate_s, gate_b);
+            UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert.gate_proj", sg_w, sg_s, sg_b);
+            UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert.up_proj", su_w, su_s, su_b);
+            UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert.down_proj", sd_w, sd_s, sd_b);
+            UPLOAD_LAYER_TRIPLET(i, "mlp.shared_expert_gate", seg_w, seg_s, seg_b);
+        }
     }
 
     printf("[init] Uploaded %.2f GB in %.1f ms (offset=%zu)\n",
@@ -714,6 +885,11 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
 
     int max_proj = NUM_ATTN_HEADS * HEAD_DIM * 2;  // full attn q_proj
     if (LINEAR_CONV_DIM > max_proj) max_proj = LINEAR_CONV_DIM;
+    // GGUF fused QKV: Q+gate + K + V = q_proj_dim + 2*kv_dim
+    if (g_quant_format == 1) {
+        int fused_qkv = NUM_ATTN_HEADS * HEAD_DIM * 2 + 2 * NUM_KV_HEADS * HEAD_DIM;
+        if (fused_qkv > max_proj) max_proj = fused_qkv;
+    }
     CHECK_CUDA(cudaMalloc(&model->buf_q_proj, max_proj * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&model->buf_k_proj, NUM_KV_HEADS * HEAD_DIM * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&model->buf_v_proj, NUM_KV_HEADS * HEAD_DIM * sizeof(float)));
@@ -727,7 +903,7 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
     CHECK_CUDA(cudaMalloc(&model->buf_shared_up, SHARED_INTERMEDIATE * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&model->buf_shared_out, HIDDEN_DIM * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&model->buf_expert_outs, MAX_K * HIDDEN_DIM * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&model->buf_expert_data, MAX_K * EXPERT_SIZE));
+    CHECK_CUDA(cudaMalloc(&model->buf_expert_data, MAX_K * g_expert_size));
 
     // Linear attention persistent state
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -775,7 +951,7 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
 
     // Expert staging (pinned host)
     for (int i = 0; i < K; i++)
-        CHECK_CUDA(cudaMallocHost(&model->h_expert_buf[i], EXPERT_SIZE));
+        CHECK_CUDA(cudaMallocHost(&model->h_expert_buf[i], g_expert_size));
 
     // Open expert files
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -813,7 +989,7 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
         }
         if (gds_ok) {
             // Register expert data buffer for GDS
-            cuFileBufRegister(model->buf_expert_data, MAX_K * EXPERT_SIZE, 0);
+            cuFileBufRegister(model->buf_expert_data, MAX_K * g_expert_size, 0);
             model->gds_available = 1;
             printf("[init] GDS: enabled (direct SSD→GPU, set ENABLE_GDS=1)\n");
         } else {
@@ -834,9 +1010,9 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
         CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
         size_t reserve = 512ULL * 1024 * 1024;  // keep 512MB free
         size_t cache_bytes = (free_mem > reserve && !skip_cache) ? free_mem - reserve : 0;
-        model->vram_cache_capacity = (int)(cache_bytes / EXPERT_SIZE);
+        model->vram_cache_capacity = (int)(cache_bytes / g_expert_size);
         if (model->vram_cache_capacity > 0) {
-            size_t alloc = (size_t)model->vram_cache_capacity * EXPERT_SIZE;
+            size_t alloc = (size_t)model->vram_cache_capacity * g_expert_size;
             CHECK_CUDA(cudaMalloc(&model->vram_cache_pool, alloc));
             model->cache_slots = (decltype(model->cache_slots))calloc(
                 model->vram_cache_capacity, sizeof(model->cache_slots[0]));
@@ -874,39 +1050,136 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
 // ============================================================================
 
 static void embed_token(Model *model, int token_id) {
-    // Compute row offset into packed embedding table
-    uint32_t packed_cols = HIDDEN_DIM / 8;  // 512
-    uint32_t num_groups = HIDDEN_DIM / GROUP_SIZE_C;  // 64
+    if (g_quant_format == 1) {
+        // GGUF embedding: use a one-hot matvec to extract the row.
+        // The embedding tensor is stored as a GGUF quantized matrix [vocab_size, hidden_dim].
+        // For a single row extraction we do a 1-element "matvec" trick:
+        // Actually, for GGUF the embedding is often F32. Use one-hot vector approach.
+        // Simpler: copy the raw row data to host, dequant if needed.
+        // For F32 embedding: row is at offset token_id * HIDDEN_DIM * sizeof(float)
+        int etype = model->qt_embed;
+        if (etype == 0) {
+            // F32 embedding: direct copy
+            float *embed_ptr = (float *)model->embed_w + (size_t)token_id * HIDDEN_DIM;
+            CHECK_CUDA(cudaMemcpy(model->buf_hidden, embed_ptr,
+                                  HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
+        } else {
+            // Quantized embedding: extract row via 1-row matvec
+            // embed is stored as [vocab_size rows, hidden_dim cols] in quantized blocks.
+            // A single row = hidden_dim elements = (hidden_dim/QK_K) blocks.
+            // We extract it by pointing the matvec at the specific row and running
+            // a 1-row x hidden_dim matvec with a ones vector.
+            // Simpler: use matvec with out_dim=1, treating the row as a 1-row matrix,
+            // and input as ones... No, that computes a dot product.
+            //
+            // Correct approach: extract raw quantized row to CPU, dequantize, upload.
+            size_t blocks_per_row, block_size;
+            if (etype == 12) { blocks_per_row = HIDDEN_DIM / 256; block_size = 144; }       // Q4_K
+            else if (etype == 13) { blocks_per_row = HIDDEN_DIM / 256; block_size = 176; }  // Q5_K
+            else if (etype == 14) { blocks_per_row = HIDDEN_DIM / 256; block_size = 210; }  // Q6_K
+            else { blocks_per_row = HIDDEN_DIM / 256; block_size = 144; }  // fallback Q4_K
 
-    uint32_t *W = model->embed_w + token_id * packed_cols;
-    uint16_t *S = model->embed_s + token_id * num_groups;
-    uint16_t *B = model->embed_b + token_id * num_groups;
+            size_t row_bytes = blocks_per_row * block_size;
+            uint8_t *row_ptr = (uint8_t *)model->embed_w + (size_t)token_id * row_bytes;
 
-    // Use dequant matvec with a "unit" input to extract the row
-    // Actually, embedding is just dequantizing a single row, not a matvec.
-    // Let's do it with a simple kernel or CPU-side.
-    // For now, CPU dequant (embedding is a one-time cost per token):
-    uint32_t h_W[512];
-    uint16_t h_S[64], h_B[64];
-    CHECK_CUDA(cudaMemcpy(h_W, W, packed_cols * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_S, S, num_groups * sizeof(uint16_t), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_B, B, num_groups * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+            // Use a 1-row matvec with identity input to dequantize
+            // Set up a unit vector [1,1,1,...,1] of size HIDDEN_DIM and do matvec
+            // with the single row as a [1, HIDDEN_DIM] matrix → output is 1 float (wrong)
+            //
+            // Actually the correct trick: treat this as a [HIDDEN_DIM, 1] matrix
+            // with input [1.0] → output[HIDDEN_DIM]. But quantized blocks operate on
+            // groups, not individual elements. So we need a dedicated dequant-row kernel.
+            //
+            // Simplest correct approach for now: dequant on CPU, upload result.
+            float h_embed[HIDDEN_DIM];
+            uint8_t *h_row = (uint8_t *)malloc(row_bytes);
+            CHECK_CUDA(cudaMemcpy(h_row, row_ptr, row_bytes, cudaMemcpyDeviceToHost));
 
-    float h_out[HIDDEN_DIM];
-    for (uint32_t g = 0; g < num_groups; g++) {
-        float scale = bf16_to_f32_host(h_S[g]);
-        float bias  = bf16_to_f32_host(h_B[g]);
-        uint32_t base = g * (GROUP_SIZE_C / 8);
-        for (uint32_t p = 0; p < GROUP_SIZE_C / 8; p++) {
-            uint32_t packed = h_W[base + p];
-            for (int n = 0; n < 8; n++) {
-                uint32_t nibble = (packed >> (n * 4)) & 0xF;
-                h_out[g * GROUP_SIZE_C + p * 8 + n] = (float)nibble * scale + bias;
+            // Dequantize Q4_K row on CPU
+            if (etype == 12) {
+                for (size_t bi = 0; bi < blocks_per_row; bi++) {
+                    const uint8_t *block = h_row + bi * 144;
+                    uint16_t d_raw, dmin_raw;
+                    memcpy(&d_raw, block, 2);
+                    memcpy(&dmin_raw, block + 2, 2);
+                    // fp16 to float (CPU-side conversion)
+                    // IEEE 754 half: sign(1) exp(5) mantissa(10)
+                    auto fp16_to_f32 = [](uint16_t h) -> float {
+                        uint32_t sign = (h >> 15) & 1;
+                        uint32_t exp = (h >> 10) & 0x1F;
+                        uint32_t mant = h & 0x3FF;
+                        if (exp == 0) {
+                            if (mant == 0) return sign ? -0.0f : 0.0f;
+                            // subnormal
+                            float val = ldexpf((float)mant, -24);
+                            return sign ? -val : val;
+                        }
+                        if (exp == 31) return sign ? -INFINITY : INFINITY;
+                        float val = ldexpf((float)(mant + 1024), (int)exp - 25);
+                        return sign ? -val : val;
+                    };
+                    float d_val = fp16_to_f32(d_raw);
+                    float dmin_val = fp16_to_f32(dmin_raw);
+                    const uint8_t *sc = block + 4;
+                    const uint8_t *qs = block + 16;
+
+                    for (int j = 0; j < 8; j++) {
+                        float ds, ms;
+                        if (j < 4) {
+                            ds = d_val * (float)(sc[j] & 63);
+                            ms = dmin_val * (float)(sc[j + 4] & 63);
+                        } else {
+                            ds = d_val * (float)((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4));
+                            ms = dmin_val * (float)((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4));
+                        }
+                        for (int l = 0; l < 16; l++) {
+                            h_embed[bi * 256 + j * 32 + l] = ds * (float)(qs[j * 16 + l] & 0xF) - ms;
+                        }
+                        for (int l = 0; l < 16; l++) {
+                            h_embed[bi * 256 + j * 32 + 16 + l] = ds * (float)(qs[j * 16 + l] >> 4) - ms;
+                        }
+                    }
+                }
+            } else {
+                // Fallback: zero embedding (will produce garbage but won't crash)
+                memset(h_embed, 0, sizeof(h_embed));
+            }
+            free(h_row);
+            CHECK_CUDA(cudaMemcpy(model->buf_hidden, h_embed,
+                                  HIDDEN_DIM * sizeof(float), cudaMemcpyHostToDevice));
+        }
+    } else {
+        // MLX affine 4-bit embedding
+        uint32_t packed_cols = HIDDEN_DIM / 8;  // 512
+        uint32_t num_groups = HIDDEN_DIM / GROUP_SIZE_C;  // 64
+
+        uint32_t *W = model->embed_w + token_id * packed_cols;
+        uint16_t *S = model->embed_s + token_id * num_groups;
+        uint16_t *B = model->embed_b + token_id * num_groups;
+
+        // CPU dequant (embedding is a one-time cost per token):
+        uint32_t h_W[512];
+        uint16_t h_S[64], h_B[64];
+        CHECK_CUDA(cudaMemcpy(h_W, W, packed_cols * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(h_S, S, num_groups * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(h_B, B, num_groups * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+        float h_out[HIDDEN_DIM];
+        for (uint32_t g = 0; g < num_groups; g++) {
+            float scale = bf16_to_f32_host(h_S[g]);
+            float bias  = bf16_to_f32_host(h_B[g]);
+            uint32_t base = g * (GROUP_SIZE_C / 8);
+            for (uint32_t p = 0; p < GROUP_SIZE_C / 8; p++) {
+                uint32_t packed = h_W[base + p];
+                for (int n = 0; n < 8; n++) {
+                    uint32_t nibble = (packed >> (n * 4)) & 0xF;
+                    h_out[g * GROUP_SIZE_C + p * 8 + n] = (float)nibble * scale + bias;
+                }
             }
         }
-    }
 
-    CHECK_CUDA(cudaMemcpy(model->buf_hidden, h_out, HIDDEN_DIM * sizeof(float), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(model->buf_hidden, h_out, HIDDEN_DIM * sizeof(float), cudaMemcpyHostToDevice));
+    }
 }
 
 // ============================================================================
@@ -947,9 +1220,9 @@ static void load_experts(Model *model, int layer_idx, const int *expert_ids, int
         GDSArg args[MAX_K];
         for (int i = 0; i < K; i++) {
             args[i].handle = model->gds_handles[layer_idx];
-            args[i].d_buf = (char *)model->buf_expert_data + i * EXPERT_SIZE;
-            args[i].size = EXPERT_SIZE;
-            args[i].offset = (off_t)expert_ids[i] * EXPERT_SIZE;
+            args[i].d_buf = (char *)model->buf_expert_data + i * g_expert_size;
+            args[i].size = g_expert_size;
+            args[i].offset = (off_t)expert_ids[i] * g_expert_size;
             pthread_create(&threads[i], NULL, gds_worker, &args[i]);
         }
         for (int i = 0; i < K; i++)
@@ -962,8 +1235,8 @@ static void load_experts(Model *model, int layer_idx, const int *expert_ids, int
         for (int i = 0; i < K; i++) {
             args[i].fd = fd;
             args[i].buf = model->h_expert_buf[i];
-            args[i].size = EXPERT_SIZE;
-            args[i].offset = (off_t)expert_ids[i] * EXPERT_SIZE;
+            args[i].size = g_expert_size;
+            args[i].offset = (off_t)expert_ids[i] * g_expert_size;
             pthread_create(&threads[i], NULL, pread_worker, &args[i]);
         }
         for (int i = 0; i < K; i++)
@@ -971,8 +1244,8 @@ static void load_experts(Model *model, int layer_idx, const int *expert_ids, int
         // Async copy to GPU
         for (int i = 0; i < K; i++) {
             CHECK_CUDA(cudaMemcpyAsync(
-                (char *)model->buf_expert_data + i * EXPERT_SIZE,
-                model->h_expert_buf[i], EXPERT_SIZE,
+                (char *)model->buf_expert_data + i * g_expert_size,
+                model->h_expert_buf[i], g_expert_size,
                 cudaMemcpyHostToDevice, model->stream_transfer));
         }
         CHECK_CUDA(cudaStreamSynchronize(model->stream_transfer));
@@ -1006,31 +1279,83 @@ static void load_experts(Model *model, int layer_idx, const int *expert_ids, int
 #define EXP_DOWN_S   (EXP_DOWN_W + EXP_DOWN_W_SZ)
 #define EXP_DOWN_B   (EXP_DOWN_S + EXP_DOWN_S_SZ)
 
+// ============================================================================
+// Format-aware RMS norm — GGUF uses f32 weights, MLX uses bf16
+// ============================================================================
+
+static inline void do_rms_norm(const float *x, const void *w, float *out,
+                                uint32_t dim, float eps, cudaStream_t s = 0) {
+    if (g_quant_format == 1) {
+        // GGUF: norm weights are F32
+        rms_norm<<<1, 256, 0, s>>>((const float *)x, (const float *)w, out, dim, eps);
+    } else {
+        // MLX: norm weights are BF16
+        launch_rms_norm_bf16(x, (const uint16_t *)w, out, dim, eps, s);
+    }
+}
+
+// ============================================================================
+// Format-aware matvec wrapper — dispatches MLX or GGUF kernel
+// ============================================================================
+
+static inline void do_matvec(
+    const uint32_t *W, const uint16_t *S, const uint16_t *B,
+    const float *x, float *out, uint32_t out_dim, uint32_t in_dim,
+    int gguf_type, cudaStream_t stream = 0
+) {
+    if (g_quant_format == 1) {
+        launch_dequant_matvec_gguf((const void *)W, x, out, out_dim, in_dim, gguf_type, stream);
+    } else {
+        launch_dequant_matvec(W, S, B, x, out, out_dim, in_dim, stream);
+    }
+}
+
 static void expert_forward(Model *model, int expert_slot, const float *input, float *output) {
-    void *base = (char *)model->buf_expert_data + expert_slot * EXPERT_SIZE;
+    if (g_quant_format == 1) {
+        // GGUF layout: gate_data + up_data + down_data, all contiguous
+        uint8_t *base = (uint8_t *)model->buf_expert_data + expert_slot * g_expert_size;
+        // gate: type from layout.json
+        launch_dequant_matvec_gguf((const void *)(base + g_gguf_gate_offset),
+            input, model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM,
+            g_gguf_gate_type);
+        // up: type from layout.json
+        launch_dequant_matvec_gguf((const void *)(base + g_gguf_up_offset),
+            input, model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM,
+            g_gguf_up_type);
+        // SwiGLU
+        launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                      MOE_INTERMEDIATE);
+        // down: type from layout.json
+        launch_dequant_matvec_gguf((const void *)(base + g_gguf_down_offset),
+            model->buf_shared_gate, output, HIDDEN_DIM, MOE_INTERMEDIATE,
+            g_gguf_down_type);
+    } else {
+        // MLX affine 4-bit layout
+        void *base = (char *)model->buf_expert_data + expert_slot * g_expert_size;
 
-    uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);
-    uint16_t *gate_s = (uint16_t *)((char *)base + EXP_GATE_S);
-    uint16_t *gate_b = (uint16_t *)((char *)base + EXP_GATE_B);
-    uint32_t *up_w   = (uint32_t *)((char *)base + EXP_UP_W);
-    uint16_t *up_s   = (uint16_t *)((char *)base + EXP_UP_S);
-    uint16_t *up_b   = (uint16_t *)((char *)base + EXP_UP_B);
-    uint32_t *down_w = (uint32_t *)((char *)base + EXP_DOWN_W);
-    uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
-    uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
+        uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);
+        uint16_t *gate_s = (uint16_t *)((char *)base + EXP_GATE_S);
+        uint16_t *gate_b = (uint16_t *)((char *)base + EXP_GATE_B);
+        uint32_t *up_w   = (uint32_t *)((char *)base + EXP_UP_W);
+        uint16_t *up_s   = (uint16_t *)((char *)base + EXP_UP_S);
+        uint16_t *up_b   = (uint16_t *)((char *)base + EXP_UP_B);
+        uint32_t *down_w = (uint32_t *)((char *)base + EXP_DOWN_W);
+        uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
+        uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-    // gate_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_gate
-    launch_dequant_matvec(gate_w, gate_s, gate_b, input, model->buf_shared_gate,
-                          MOE_INTERMEDIATE, HIDDEN_DIM);
-    // up_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_up
-    launch_dequant_matvec(up_w, up_s, up_b, input, model->buf_shared_up,
-                          MOE_INTERMEDIATE, HIDDEN_DIM);
-    // SwiGLU
-    launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                  MOE_INTERMEDIATE);
-    // down_proj: [HIDDEN_DIM, MOE_INTERMEDIATE] → output
-    launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate, output,
-                          HIDDEN_DIM, MOE_INTERMEDIATE);
+        // gate_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_gate
+        launch_dequant_matvec(gate_w, gate_s, gate_b, input, model->buf_shared_gate,
+                              MOE_INTERMEDIATE, HIDDEN_DIM);
+        // up_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] → buf_shared_up
+        launch_dequant_matvec(up_w, up_s, up_b, input, model->buf_shared_up,
+                              MOE_INTERMEDIATE, HIDDEN_DIM);
+        // SwiGLU
+        launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                      MOE_INTERMEDIATE);
+        // down_proj: [HIDDEN_DIM, MOE_INTERMEDIATE] → output
+        launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate, output,
+                              HIDDEN_DIM, MOE_INTERMEDIATE);
+    }
 }
 
 // ============================================================================
@@ -1122,8 +1447,8 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t0 = now_ms(); }
 
     // 1. Input RMS norm
-    launch_rms_norm_bf16(model->buf_hidden, L.input_norm_w, model->buf_normed,
-                         HIDDEN_DIM, RMS_NORM_EPS);
+    do_rms_norm(model->buf_hidden, L.input_norm_w, model->buf_normed,
+                HIDDEN_DIM, RMS_NORM_EPS);
 
     // Save residual
     CHECK_CUDA(cudaMemcpy(model->buf_residual, model->buf_hidden,
@@ -1137,12 +1462,28 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;  // interleaved Q + gate
         int kv_dim = NUM_KV_HEADS * HEAD_DIM;
 
-        launch_dequant_matvec(L.q_w, L.q_s, L.q_b, model->buf_normed,
-                              model->buf_q_proj, q_proj_dim, HIDDEN_DIM);
-        launch_dequant_matvec(L.k_w, L.k_s, L.k_b, model->buf_normed,
-                              model->buf_k_proj, kv_dim, HIDDEN_DIM);
-        launch_dequant_matvec(L.v_w, L.v_s, L.v_b, model->buf_normed,
-                              model->buf_v_proj, kv_dim, HIDDEN_DIM);
+        if (g_quant_format == 1 && L.full_qkv_w) {
+            // GGUF: fused QKV tensor → single matvec, then split output
+            int fused_dim = q_proj_dim + 2 * kv_dim;
+            do_matvec(L.full_qkv_w, NULL, NULL, model->buf_normed,
+                      model->buf_q_proj, fused_dim, HIDDEN_DIM,
+                      L.qt_full_qkv);
+            // Split: buf_q_proj[0..q_proj_dim) = Q+gate,
+            //        buf_q_proj[q_proj_dim..q_proj_dim+kv_dim) = K,
+            //        buf_q_proj[q_proj_dim+kv_dim..) = V
+            CHECK_CUDA(cudaMemcpy(model->buf_k_proj, (float *)model->buf_q_proj + q_proj_dim,
+                                  kv_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+            CHECK_CUDA(cudaMemcpy(model->buf_v_proj, (float *)model->buf_q_proj + q_proj_dim + kv_dim,
+                                  kv_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+        } else {
+            // MLX: separate Q, K, V projections
+            do_matvec(L.q_w, L.q_s, L.q_b, model->buf_normed,
+                      model->buf_q_proj, q_proj_dim, HIDDEN_DIM, L.qt_q);
+            do_matvec(L.k_w, L.k_s, L.k_b, model->buf_normed,
+                      model->buf_k_proj, kv_dim, HIDDEN_DIM, L.qt_k);
+            do_matvec(L.v_w, L.v_s, L.v_b, model->buf_normed,
+                      model->buf_v_proj, kv_dim, HIDDEN_DIM, L.qt_v);
+        }
         CHECK_CUDA(cudaDeviceSynchronize());
 
         // Deinterleave Q and Q_gate, apply Q/K norms, RoPE, attention — on CPU
@@ -1223,19 +1564,19 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
         // O projection
         int oproj_in = NUM_ATTN_HEADS * HEAD_DIM;
-        launch_dequant_matvec(L.o_w, L.o_s, L.o_b, model->buf_attn_out,
-                              model->buf_h_mid, HIDDEN_DIM, oproj_in);
+        do_matvec(L.o_w, L.o_s, L.o_b, model->buf_attn_out,
+                  model->buf_h_mid, HIDDEN_DIM, oproj_in, L.qt_o);
 
     } else {
         // Linear attention (GatedDeltaNet) path — all on GPU
-        launch_dequant_matvec(L.qkv_w, L.qkv_s, L.qkv_b, model->buf_normed,
-                              model->buf_q_proj, LINEAR_CONV_DIM, HIDDEN_DIM);
-        launch_dequant_matvec(L.z_w, L.z_s, L.z_b, model->buf_normed,
-                              model->buf_z_proj, LINEAR_TOTAL_VALUE, HIDDEN_DIM);
-        launch_dequant_matvec(L.b_w, L.b_s, L.b_b, model->buf_normed,
-                              model->buf_beta_proj, LINEAR_NUM_V_HEADS, HIDDEN_DIM);
-        launch_dequant_matvec(L.a_w, L.a_s, L.a_b, model->buf_normed,
-                              model->buf_alpha_proj, LINEAR_NUM_V_HEADS, HIDDEN_DIM);
+        do_matvec(L.qkv_w, L.qkv_s, L.qkv_b, model->buf_normed,
+                  model->buf_q_proj, LINEAR_CONV_DIM, HIDDEN_DIM, L.qt_qkv);
+        do_matvec(L.z_w, L.z_s, L.z_b, model->buf_normed,
+                  model->buf_z_proj, LINEAR_TOTAL_VALUE, HIDDEN_DIM, L.qt_z);
+        do_matvec(L.b_w, L.b_s, L.b_b, model->buf_normed,
+                  model->buf_beta_proj, LINEAR_NUM_V_HEADS, HIDDEN_DIM, L.qt_b);
+        do_matvec(L.a_w, L.a_s, L.a_b, model->buf_normed,
+                  model->buf_alpha_proj, LINEAR_NUM_V_HEADS, HIDDEN_DIM, L.qt_a);
 
         // Conv1d step
         conv1d_step<<<(LINEAR_CONV_DIM + 255) / 256, 256>>>(
@@ -1272,23 +1613,23 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             LINEAR_VALUE_DIM, RMS_NORM_EPS);
 
         // Output projection
-        launch_dequant_matvec(L.out_proj_w, L.out_proj_s, L.out_proj_b,
-                              model->buf_attn_out, model->buf_h_mid,
-                              HIDDEN_DIM, LINEAR_TOTAL_VALUE);
+        do_matvec(L.out_proj_w, L.out_proj_s, L.out_proj_b,
+                  model->buf_attn_out, model->buf_h_mid,
+                  HIDDEN_DIM, LINEAR_TOTAL_VALUE, L.qt_out);
     }
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.attn_compute += t1-t0; t0=t1; }
 
     // 3. Residual + post-attention norm
     launch_residual_add(model->buf_residual, model->buf_h_mid, model->buf_h_mid, HIDDEN_DIM);
-    launch_rms_norm_bf16(model->buf_h_mid, L.post_attn_norm_w, model->buf_normed,
-                         HIDDEN_DIM, RMS_NORM_EPS);
+    do_rms_norm(model->buf_h_mid, L.post_attn_norm_w, model->buf_normed,
+                HIDDEN_DIM, RMS_NORM_EPS);
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.oproj_residual += t1-t0; t0=t1; }
 
     // 4. MoE routing
-    launch_dequant_matvec(L.gate_w, L.gate_s, L.gate_b, model->buf_normed,
-                          model->buf_gate_scores, NUM_EXPERTS, HIDDEN_DIM);
+    do_matvec(L.gate_w, L.gate_s, L.gate_b, model->buf_normed,
+              model->buf_gate_scores, NUM_EXPERTS, HIDDEN_DIM, L.qt_gate);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     float h_scores[NUM_EXPERTS];
@@ -1306,18 +1647,18 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     if (g_timing_enabled) { t1 = now_ms(); g_layer_timing.routing += t1-t0; t0=t1; }
 
     // 5. Shared expert forward + expert I/O OVERLAP
-    launch_dequant_matvec(L.sg_w, L.sg_s, L.sg_b, model->buf_normed,
-                          model->buf_shared_gate, SHARED_INTERMEDIATE, HIDDEN_DIM);
-    launch_dequant_matvec(L.su_w, L.su_s, L.su_b, model->buf_normed,
-                          model->buf_shared_up, SHARED_INTERMEDIATE, HIDDEN_DIM);
+    do_matvec(L.sg_w, L.sg_s, L.sg_b, model->buf_normed,
+              model->buf_shared_gate, SHARED_INTERMEDIATE, HIDDEN_DIM, L.qt_sg);
+    do_matvec(L.su_w, L.su_s, L.su_b, model->buf_normed,
+              model->buf_shared_up, SHARED_INTERMEDIATE, HIDDEN_DIM, L.qt_su);
     launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
                   SHARED_INTERMEDIATE);
-    launch_dequant_matvec(L.sd_w, L.sd_s, L.sd_b, model->buf_shared_gate,
-                          model->buf_shared_out, HIDDEN_DIM, SHARED_INTERMEDIATE);
+    do_matvec(L.sd_w, L.sd_s, L.sd_b, model->buf_shared_gate,
+              model->buf_shared_out, HIDDEN_DIM, SHARED_INTERMEDIATE, L.qt_sd);
 
     // Shared expert gate score (can overlap with I/O)
-    launch_dequant_matvec(L.seg_w, L.seg_s, L.seg_b, model->buf_normed,
-                          model->buf_gate_scores, 1, HIDDEN_DIM);
+    do_matvec(L.seg_w, L.seg_s, L.seg_b, model->buf_normed,
+              model->buf_gate_scores, 1, HIDDEN_DIM, L.qt_seg);
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.shared_expert += t1-t0; t0=t1; }
 
@@ -1337,7 +1678,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             if (slot >= 0 && model->cache_slots[slot].layer == layer_idx &&
                 model->cache_slots[slot].expert_id == eid) {
                 // Cache hit — point directly at VRAM cache slot
-                expert_ptrs[k] = (char *)model->vram_cache_pool + (size_t)slot * EXPERT_SIZE;
+                expert_ptrs[k] = (char *)model->vram_cache_pool + (size_t)slot * g_expert_size;
                 model->cache_slots[slot].last_used = model->vram_cache_clock;
                 model->cache_slots[slot].access_count++;
             } else {
@@ -1356,8 +1697,8 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             for (int i = 0; i < n_ssd; i++) {
                 args[i].fd = fd;
                 args[i].buf = model->h_expert_buf[i];
-                args[i].size = EXPERT_SIZE;
-                args[i].offset = (off_t)need_ssd_ids[i] * EXPERT_SIZE;
+                args[i].size = g_expert_size;
+                args[i].offset = (off_t)need_ssd_ids[i] * g_expert_size;
                 pthread_create(&threads[i], NULL, pread_worker, &args[i]);
             }
             for (int i = 0; i < n_ssd; i++)
@@ -1396,13 +1737,13 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                 }
 
                 if (slot >= 0) {
-                    void *dst = (char *)model->vram_cache_pool + (size_t)slot * EXPERT_SIZE;
+                    void *dst = (char *)model->vram_cache_pool + (size_t)slot * g_expert_size;
                     // Copy to temp buffer first (for immediate use), then async to cache
-                    void *tmp = (char *)model->buf_expert_data + k * EXPERT_SIZE;
-                    CHECK_CUDA(cudaMemcpy(tmp, model->h_expert_buf[i], EXPERT_SIZE,
+                    void *tmp = (char *)model->buf_expert_data + k * g_expert_size;
+                    CHECK_CUDA(cudaMemcpy(tmp, model->h_expert_buf[i], g_expert_size,
                                           cudaMemcpyHostToDevice));
                     // Async copy to cache slot (runs in background)
-                    CHECK_CUDA(cudaMemcpyAsync(dst, tmp, EXPERT_SIZE,
+                    CHECK_CUDA(cudaMemcpyAsync(dst, tmp, g_expert_size,
                                                cudaMemcpyDeviceToDevice, model->stream_transfer));
                     model->cache_slots[slot].layer = layer_idx;
                     model->cache_slots[slot].expert_id = eid;
@@ -1413,9 +1754,9 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                 } else {
                     // No cache — use temporary buffer
                     CHECK_CUDA(cudaMemcpy(
-                        (char *)model->buf_expert_data + k * EXPERT_SIZE,
-                        model->h_expert_buf[i], EXPERT_SIZE, cudaMemcpyHostToDevice));
-                    expert_ptrs[k] = (char *)model->buf_expert_data + k * EXPERT_SIZE;
+                        (char *)model->buf_expert_data + k * g_expert_size,
+                        model->h_expert_buf[i], g_expert_size, cudaMemcpyHostToDevice));
+                    expert_ptrs[k] = (char *)model->buf_expert_data + k * g_expert_size;
                 }
             }
         }
@@ -1425,26 +1766,43 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
     // 7. Expert forward (K experts on GPU, using cached pointers)
     for (int k = 0; k < K; k++) {
-        void *base = expert_ptrs[k];
+        if (g_quant_format == 1) {
+            // GGUF expert layout
+            uint8_t *base = (uint8_t *)expert_ptrs[k];
+            launch_dequant_matvec_gguf((const void *)(base + g_gguf_gate_offset),
+                model->buf_normed, model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM,
+                g_gguf_gate_type);
+            launch_dequant_matvec_gguf((const void *)(base + g_gguf_up_offset),
+                model->buf_normed, model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM,
+                g_gguf_up_type);
+            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                          MOE_INTERMEDIATE);
+            launch_dequant_matvec_gguf((const void *)(base + g_gguf_down_offset),
+                model->buf_shared_gate, model->buf_expert_outs + k * HIDDEN_DIM,
+                HIDDEN_DIM, MOE_INTERMEDIATE, g_gguf_down_type);
+        } else {
+            // MLX expert layout
+            void *base = expert_ptrs[k];
 
-        uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);
-        uint16_t *gate_s = (uint16_t *)((char *)base + EXP_GATE_S);
-        uint16_t *gate_b = (uint16_t *)((char *)base + EXP_GATE_B);
-        uint32_t *up_w   = (uint32_t *)((char *)base + EXP_UP_W);
-        uint16_t *up_s   = (uint16_t *)((char *)base + EXP_UP_S);
-        uint16_t *up_b   = (uint16_t *)((char *)base + EXP_UP_B);
-        uint32_t *down_w = (uint32_t *)((char *)base + EXP_DOWN_W);
-        uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
-        uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
+            uint32_t *gate_w = (uint32_t *)((char *)base + EXP_GATE_W);
+            uint16_t *gate_s = (uint16_t *)((char *)base + EXP_GATE_S);
+            uint16_t *gate_b = (uint16_t *)((char *)base + EXP_GATE_B);
+            uint32_t *up_w   = (uint32_t *)((char *)base + EXP_UP_W);
+            uint16_t *up_s   = (uint16_t *)((char *)base + EXP_UP_S);
+            uint16_t *up_b   = (uint16_t *)((char *)base + EXP_UP_B);
+            uint32_t *down_w = (uint32_t *)((char *)base + EXP_DOWN_W);
+            uint16_t *down_s = (uint16_t *)((char *)base + EXP_DOWN_S);
+            uint16_t *down_b = (uint16_t *)((char *)base + EXP_DOWN_B);
 
-        launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
-                              model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
-        launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
-                              model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
-        launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
-                      MOE_INTERMEDIATE);
-        launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
-                              model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+            launch_dequant_matvec(gate_w, gate_s, gate_b, model->buf_normed,
+                                  model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM);
+            launch_dequant_matvec(up_w, up_s, up_b, model->buf_normed,
+                                  model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM);
+            launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
+                          MOE_INTERMEDIATE);
+            launch_dequant_matvec(down_w, down_s, down_b, model->buf_shared_gate,
+                                  model->buf_expert_outs + k * HIDDEN_DIM, HIDDEN_DIM, MOE_INTERMEDIATE);
+        }
     }
 
     // 8. MoE combine + residual (no per-layer malloc)
@@ -1496,12 +1854,12 @@ static int forward(Model *model, int token_id, int pos, int K) {
     }
 
     // Final RMS norm
-    launch_rms_norm_bf16(model->buf_hidden, model->final_norm_w, model->buf_normed,
-                         HIDDEN_DIM, RMS_NORM_EPS);
+    do_rms_norm(model->buf_hidden, model->final_norm_w, model->buf_normed,
+                HIDDEN_DIM, RMS_NORM_EPS);
     // LM head: [VOCAB_SIZE, HIDDEN_DIM] → logits
-    launch_dequant_matvec(model->lm_head_w, model->lm_head_s, model->lm_head_b,
-                          model->buf_normed, model->buf_logits,
-                          VOCAB_SIZE, HIDDEN_DIM);
+    do_matvec(model->lm_head_w, model->lm_head_s, model->lm_head_b,
+              model->buf_normed, model->buf_logits,
+              VOCAB_SIZE, HIDDEN_DIM, model->qt_lm_head);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Copy logits to host and argmax
@@ -2796,6 +3154,80 @@ int main(int argc, char **argv) {
     // Load weights
     WeightFile *wf = open_weights(weights_path, manifest_path);
     if (!wf) return 1;
+
+    // Detect GGUF format from manifest
+    if ((g_manifest_json && strstr(g_manifest_json, "\"quant_format\": \"gguf\"")) ||
+        (g_manifest_json && strstr(g_manifest_json, "\"quant_format\":\"gguf\""))) {
+        g_quant_format = 1;
+        printf("[init] GGUF weight format detected\n");
+    }
+
+    // Read expert layout for GGUF
+    if (g_quant_format == 1) {
+        char layout_path[512];
+        snprintf(layout_path, sizeof(layout_path), "%s/layout.json", expert_dir);
+        FILE *lf = fopen(layout_path, "r");
+        if (lf) {
+            fseek(lf, 0, SEEK_END);
+            long lsz = ftell(lf);
+            fseek(lf, 0, SEEK_SET);
+            char *ljson = (char *)malloc(lsz + 1);
+            ljson[fread(ljson, 1, lsz, lf)] = '\0';
+            fclose(lf);
+
+            // Parse expert_size
+            const char *es = strstr(ljson, "\"expert_size\"");
+            if (es) { const char *c = strchr(es, ':'); if (c) g_expert_size = strtoul(c + 1, NULL, 10); }
+
+            // Parse components array for offsets and types
+            // Format: "components": [{"name": "gate_exps", "offset": 0, "size": N, "gguf_type": 12}, ...]
+            const char *comp = strstr(ljson, "\"components\"");
+            if (comp) {
+                // gate
+                const char *gate_c = strstr(comp, "\"gate_exps\"");
+                if (!gate_c) gate_c = strstr(comp, "gate");
+                if (gate_c) {
+                    const char *off_k = strstr(gate_c, "\"offset\"");
+                    if (off_k) { const char *c2 = strchr(off_k, ':'); if (c2) g_gguf_gate_offset = strtoul(c2 + 1, NULL, 10); }
+                    const char *sz_k = strstr(gate_c, "\"size\"");
+                    if (sz_k) { const char *c2 = strchr(sz_k, ':'); if (c2) g_gguf_gate_size = strtoul(c2 + 1, NULL, 10); }
+                    const char *gt_k = strstr(gate_c, "\"gguf_type\"");
+                    if (gt_k) { const char *c2 = strchr(gt_k, ':'); if (c2) g_gguf_gate_type = atoi(c2 + 1); }
+                }
+                // up (search after gate)
+                const char *up_c = strstr(gate_c ? gate_c + 1 : comp, "\"up_exps\"");
+                if (!up_c) up_c = strstr(gate_c ? gate_c + 1 : comp, "up");
+                if (up_c) {
+                    const char *off_k = strstr(up_c, "\"offset\"");
+                    if (off_k) { const char *c2 = strchr(off_k, ':'); if (c2) g_gguf_up_offset = strtoul(c2 + 1, NULL, 10); }
+                    const char *sz_k = strstr(up_c, "\"size\"");
+                    if (sz_k) { const char *c2 = strchr(sz_k, ':'); if (c2) g_gguf_up_size = strtoul(c2 + 1, NULL, 10); }
+                    const char *gt_k = strstr(up_c, "\"gguf_type\"");
+                    if (gt_k) { const char *c2 = strchr(gt_k, ':'); if (c2) g_gguf_up_type = atoi(c2 + 1); }
+                }
+                // down (search after up)
+                const char *down_c = strstr(up_c ? up_c + 1 : comp, "\"down_exps\"");
+                if (!down_c) down_c = strstr(up_c ? up_c + 1 : comp, "down");
+                if (down_c) {
+                    const char *off_k = strstr(down_c, "\"offset\"");
+                    if (off_k) { const char *c2 = strchr(off_k, ':'); if (c2) g_gguf_down_offset = strtoul(c2 + 1, NULL, 10); }
+                    const char *sz_k = strstr(down_c, "\"size\"");
+                    if (sz_k) { const char *c2 = strchr(sz_k, ':'); if (c2) g_gguf_down_size = strtoul(c2 + 1, NULL, 10); }
+                    const char *gt_k = strstr(down_c, "\"gguf_type\"");
+                    if (gt_k) { const char *c2 = strchr(gt_k, ':'); if (c2) g_gguf_down_type = atoi(c2 + 1); }
+                }
+            }
+
+            printf("[init] GGUF expert layout: size=%zu, gate@%zu(%d) up@%zu(%d) down@%zu(%d)\n",
+                   g_expert_size,
+                   g_gguf_gate_offset, g_gguf_gate_type,
+                   g_gguf_up_offset, g_gguf_up_type,
+                   g_gguf_down_offset, g_gguf_down_type);
+            free(ljson);
+        } else {
+            fprintf(stderr, "WARNING: GGUF format but no %s found\n", layout_path);
+        }
+    }
 
     // Load vocab
     // (vocab.bin format: u32 num_entries, u32 max_id, then per entry: u16 len + bytes)
