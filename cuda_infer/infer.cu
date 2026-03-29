@@ -1746,11 +1746,18 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f\n", "beta_gate", db[0],db[1],db[2],db[3]);
         }
 
+        // Scale Q by 1/sqrt(key_dim) before delta-net (matching llama.cpp)
+        if (g_quant_format == 1) {
+            float q_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
+            vec_scale<<<(LINEAR_TOTAL_KEY + 255)/256, 256>>>(
+                model->buf_conv_output, q_scale, LINEAR_TOTAL_KEY);
+        }
+
         // GatedDeltaNet recurrence
         uint32_t khpv = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;
         gated_delta_net_step<<<LINEAR_NUM_V_HEADS, 128>>>(
             model->delta_state[layer_idx],
-            model->buf_conv_output,                           // q [2048]
+            model->buf_conv_output,                           // q [2048] (scaled for GGUF)
             model->buf_conv_output + LINEAR_TOTAL_KEY,        // k [2048]
             model->buf_conv_output + 2 * LINEAR_TOTAL_KEY,    // v [8192]
             model->buf_g_decay, model->buf_beta_gate,

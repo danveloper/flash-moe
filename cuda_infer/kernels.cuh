@@ -1175,6 +1175,12 @@ static inline void launch_rms_norm_bf16(const float* x, const uint16_t* w, float
     rms_norm_bf16<<<1, 256, 0, s>>>(x, w, out, dim, eps);
 }
 
+// In-place vector scale: x[i] *= scale
+__global__ void vec_scale(float* __restrict__ x, float scale, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= scale;
+}
+
 static inline void launch_residual_add(const float* a, const float* b, float* out, uint32_t dim, cudaStream_t s = 0) {
     residual_add<<<(dim+255)/256, 256, 0, s>>>(a, b, out, dim);
 }
