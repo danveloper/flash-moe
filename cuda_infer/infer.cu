@@ -1466,6 +1466,50 @@ static struct {
     int count;
 } g_layer_timing;
 
+// One-shot Q5_K kernel verification against Python reference
+static void verify_q5k_kernel(Model *model) {
+    if (g_quant_format != 1) return;
+    // Layer 0 QKV is Q5_K. Run matvec with ones input, check output.
+    uint32_t *qkv_w = model->layers[0].qkv_w;
+    if (!qkv_w) return;
+    float *d_ones, *d_out;
+    CHECK_CUDA(cudaMalloc(&d_ones, HIDDEN_DIM * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_out, LINEAR_CONV_DIM * sizeof(float)));
+    float *h_ones = (float*)malloc(HIDDEN_DIM * sizeof(float));
+    for (int i = 0; i < HIDDEN_DIM; i++) h_ones[i] = 1.0f;
+    CHECK_CUDA(cudaMemcpy(d_ones, h_ones, HIDDEN_DIM * sizeof(float), cudaMemcpyHostToDevice));
+    launch_dequant_matvec_q5k((const uint8_t*)qkv_w, d_ones, d_out,
+                               LINEAR_CONV_DIM, HIDDEN_DIM);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    float h_out[5];
+    CHECK_CUDA(cudaMemcpy(h_out, d_out, 5*sizeof(float), cudaMemcpyDeviceToHost));
+    printf("[verify] Q5_K kernel (ones input) out[0..4] = %.6f %.6f %.6f %.6f %.6f\n",
+           h_out[0], h_out[1], h_out[2], h_out[3], h_out[4]);
+    printf("[verify] Python reference:                    -0.327011 1.785097 0.084108 0.016506 -1.251458\n");
+
+    // Also verify Q6_K with shared expert down_proj (layer 0)
+    uint32_t *sd_w = model->layers[0].sd_w;
+    if (sd_w && model->layers[0].qt_sd == 14) {
+        float *d_ones6, *d_out6;
+        CHECK_CUDA(cudaMalloc(&d_ones6, SHARED_INTERMEDIATE * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_out6, HIDDEN_DIM * sizeof(float)));
+        float *h6 = (float*)malloc(SHARED_INTERMEDIATE * sizeof(float));
+        for (int i = 0; i < SHARED_INTERMEDIATE; i++) h6[i] = 1.0f;
+        CHECK_CUDA(cudaMemcpy(d_ones6, h6, SHARED_INTERMEDIATE * sizeof(float), cudaMemcpyHostToDevice));
+        launch_dequant_matvec_q6k((const uint8_t*)sd_w, d_ones6, d_out6, HIDDEN_DIM, SHARED_INTERMEDIATE);
+        CHECK_CUDA(cudaDeviceSynchronize());
+        float ho[5];
+        CHECK_CUDA(cudaMemcpy(ho, d_out6, 5*sizeof(float), cudaMemcpyDeviceToHost));
+        printf("[verify] Q6_K kernel (ones) out[0..4] = %.6f %.6f %.6f %.6f %.6f\n",
+               ho[0], ho[1], ho[2], ho[3], ho[4]);
+        printf("[verify] Python reference:               -0.736804 -0.150297 -0.063833 0.046720 -0.036440\n");
+        free(h6); CHECK_CUDA(cudaFree(d_ones6)); CHECK_CUDA(cudaFree(d_out6));
+    }
+    free(h_ones);
+    CHECK_CUDA(cudaFree(d_ones));
+    CHECK_CUDA(cudaFree(d_out));
+}
+
 static void layer_forward(Model *model, int layer_idx, int pos, int K) {
     auto &L = model->layers[layer_idx];
     double t0, t1;
