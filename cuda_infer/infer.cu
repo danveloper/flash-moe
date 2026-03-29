@@ -1680,6 +1680,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             DUMP5("conv_Q[0:5]", model->buf_conv_output);
             DUMP5("conv_K[0:5]", model->buf_conv_output + LINEAR_TOTAL_KEY);
             DUMP5("conv_V[0:5]", model->buf_conv_output + 2 * LINEAR_TOTAL_KEY);
+            DUMP5("conv_V_h1[0:5]", model->buf_conv_output + 2 * LINEAR_TOTAL_KEY + 128);
             DUMP5("z_proj", model->buf_z_proj);
             DUMP5("alpha", model->buf_alpha_proj);
             DUMP5("beta", model->buf_beta_proj);
@@ -1773,6 +1774,13 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaMemcpy(d5, model->buf_attn_out, 5*sizeof(float), cudaMemcpyDeviceToHost));
             printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "gated_norm", d5[0],d5[1],d5[2],d5[3],d5[4]);
+            // Save full gated_norm for comparison
+            float *gn = (float*)malloc(LINEAR_TOTAL_VALUE * sizeof(float));
+            CHECK_CUDA(cudaMemcpy(gn, model->buf_attn_out, LINEAR_TOTAL_VALUE * sizeof(float), cudaMemcpyDeviceToHost));
+            FILE *gf = fopen("/tmp/cuda_gated_norm.bin", "wb");
+            fwrite(gn, sizeof(float), LINEAR_TOTAL_VALUE, gf);
+            fclose(gf); free(gn);
+            printf("[ref] Saved gated_norm (%d floats) to /tmp/cuda_gated_norm.bin\n", LINEAR_TOTAL_VALUE);
         }
 
         // Output projection
