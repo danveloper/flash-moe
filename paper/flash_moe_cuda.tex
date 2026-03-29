@@ -231,6 +231,34 @@ Apple M3 Max (reference) & 4.36 & --- \\
 \end{tabular}
 \end{table}
 
+\subsection{Comparison with llama.cpp}
+
+We benchmarked llama.cpp (commit \texttt{master}, CUDA build) on the same RTX~4090 system with 64\,GB RAM using the Unsloth Q4\_K\_XL GGUF quantization of Qwen3.5-397B-A17B (228\,GB, 6 shards):
+
+\begin{table}[h]
+\centering
+\small
+\caption{llama.cpp vs.\ Flash-MoE CUDA on RTX~4090 with 64\,GB RAM. Same model (Qwen3.5-397B-A17B at 4-bit), same hardware, same prompt.}
+\label{tab:llamacpp}
+\begin{tabular}{lccc}
+\toprule
+\textbf{System} & \textbf{Config} & \textbf{tok/s} & \textbf{RAM Used} \\
+\midrule
+\textbf{Flash-MoE CUDA} & VRAM cache (warm) & \textbf{5.35} & 5.5 GB \\
+Flash-MoE CUDA & Cold start & 2.49 & 5.5 GB \\
+\midrule
+llama.cpp & \texttt{-ngl 99} (full GPU) & OOM & --- \\
+llama.cpp & \texttt{-ngl 0} (CPU only) & $<$0.05$^\dagger$ & 54 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$^\dagger$\textit{llama.cpp CPU-only mode ran for over 2 hours without completing 20 tokens of generation. Estimated throughput: $<$0.05~tok/s. The 228\,GB GGUF file is memory-mapped; with only 64\,GB of physical RAM, the OS pages data in and out continuously, causing catastrophic thrashing.}
+
+With \texttt{-ngl 99} (full GPU offload), llama.cpp crashes because the 228\,GB model cannot fit in 24\,GB of VRAM. With \texttt{-ngl 0} (CPU-only), llama.cpp memory-maps the entire GGUF file (258\,GB virtual, 54\,GB resident), consuming nearly all system RAM for weight data and leaving no room for effective page caching.
+
+Flash-MoE's approach---streaming only the 4 active experts per layer ($\sim$27\,MB/layer) rather than mapping the entire model---avoids this fundamental problem. The VRAM expert cache further eliminates 95\% of I/O for sustained generation, achieving over 100$\times$ higher throughput than llama.cpp on the same hardware.
+
 \subsection{VRAM Cache Warm-Up}
 
 The VRAM cache warms progressively over requests in server mode:
