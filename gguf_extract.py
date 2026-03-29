@@ -450,32 +450,56 @@ def main():
     expert_dir = output_dir / 'packed_experts'
     expert_dir.mkdir(exist_ok=True)
 
-    # Write layout.json
+    # Compute per-component max sizes across all layers (i1 quant mixes Q4_K/Q6_K)
+    max_comp_size = {}
+    for proj in ['gate', 'up', 'down']:
+        sizes = set()
+        types = set()
+        for layer_idx in expert_layers:
+            t = expert_tensors[(layer_idx, proj)]
+            per_expert = t['nbytes'] // num_experts
+            sizes.add(per_expert)
+            types.add(t['type'])
+        max_comp_size[proj] = max(sizes)
+        if len(types) > 1:
+            print(f"  NOTE: {proj}_exps has mixed quant types across layers: "
+                  f"{', '.join(QUANT_NAMES.get(t, str(t)) for t in sorted(types))}")
+
+    # Use max sizes for uniform expert layout (smaller data is zero-padded)
     components = []
     comp_offset = 0
     for proj in ['gate', 'up', 'down']:
-        t = expert_tensors[(expert_layers[0], proj)]
-        per_expert = t['nbytes'] // num_experts
         components.append({
             'name': f'{proj}_exps',
             'offset': comp_offset,
-            'size': per_expert,
-            'gguf_type': t['type'],
-            'dtype': QUANT_NAMES.get(t['type'], f"type{t['type']}"),
+            'slot_size': max_comp_size[proj],  # allocated slot (max across layers)
         })
-        comp_offset += per_expert
+        comp_offset += max_comp_size[proj]
+    expert_size = comp_offset
+
+    # Per-layer component types and actual sizes
+    layer_info = []
+    for layer_idx in expert_layers:
+        li = {}
+        for proj in ['gate', 'up', 'down']:
+            t = expert_tensors[(layer_idx, proj)]
+            per_expert = t['nbytes'] // num_experts
+            li[f'{proj}_type'] = t['type']
+            li[f'{proj}_size'] = per_expert
+        layer_info.append(li)
 
     layout = {
         'expert_size': expert_size,
         'num_layers': len(expert_layers),
         'num_experts': num_experts,
         'components': components,
+        'layer_info': layer_info,
         'format': 'gguf',
     }
     layout_path = expert_dir / 'layout.json'
     with open(layout_path, 'w') as f:
         json.dump(layout, f, indent=2)
-    print(f"  Layout: {expert_size} bytes/expert, {num_experts} experts/layer")
+    print(f"  Layout: {expert_size} bytes/expert (uniform), {num_experts} experts/layer")
 
     layer_size = num_experts * expert_size
     t0 = time.time()
@@ -484,26 +508,20 @@ def main():
     for i, layer_idx in enumerate(expert_layers):
         out_path = expert_dir / f'layer_{layer_idx:02d}.bin'
         fd_out = os.open(str(out_path), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-        os.ftruncate(fd_out, layer_size)
+        os.ftruncate(fd_out, layer_size)  # zero-filled
 
-        dst_offset = 0
-        for proj in ['gate', 'up', 'down']:
+        for proj_idx, proj in enumerate(['gate', 'up', 'down']):
             t = expert_tensors[(layer_idx, proj)]
             per_expert = t['nbytes'] // num_experts
+            slot_offset = components[proj_idx]['offset']
 
-            # Read all expert data for this component
             data = reader.read_tensor_data(t)
 
-            # The GGUF tensor is [dim1, dim2, num_experts] with experts as the
-            # outermost dimension in memory. Each expert's data is contiguous.
             for e in range(num_experts):
                 src_start = e * per_expert
-                expert_dst = e * expert_size + (dst_offset - 0)
-                # dst_offset is the component offset within expert block
+                # Write actual data at the component's slot offset (zero-padded if smaller)
                 os.pwrite(fd_out, data[src_start:src_start + per_expert],
-                          e * expert_size + components[['gate', 'up', 'down'].index(proj)]['offset'])
-
-            dst_offset += per_expert
+                          e * expert_size + slot_offset)
 
         os.close(fd_out)
         total_written += layer_size

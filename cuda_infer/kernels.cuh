@@ -917,50 +917,60 @@ __global__ void dequant_matvec_q6k(
     const uint8_t *row_data = W_q6k + (size_t)row * blocks_per_row * Q6_K_BLOCK_SIZE;
     float acc = 0.0f;
 
+    // Q6_K block layout (210 bytes = 128 + 64 + 16 + 2):
+    //   ql[128]: low 4 bits, 2 per byte
+    //   qh[64]:  high 2 bits, 4 per byte
+    //   scales[16]: int8 per-16-element scale
+    //   d: fp16 super-block scale
+    //
+    // GGML element ordering (from dequantize_row_q6_K):
+    //   For 2 halves of 128 elements each:
+    //     Half 0 (elements 0-127):  ql[0..63] low nibbles  + qh[0..31] bits 0-1
+    //     Half 1 (elements 128-255): ql[0..63] high nibbles + qh[0..31] bits 2-3
+    //   Within each half, 8 groups of 16:
+    //     group j (0-7): ql[j*8..j*8+7] provides 16 low nibbles (2 per byte)
+    //                    qh[j*4..j*4+3] provides high bits for 16 elements (4 per byte)
+
+    // Q6_K dequant follows ggml dequantize_row_q6_K exactly:
+    // Block = ql[128] + qh[64] + scales[16] + d(fp16)
+    // 2 halves of 128 elements, each half: 64 ql bytes, 32 qh bytes, 8 scales
+    // For l=0..31:
+    //   y[l+ 0] = d*sc[0] * (((ql[l]&0xF)    | ((qh[l]>>0)&3)<<4) - 32)
+    //   y[l+32] = d*sc[2] * (((ql[l+32]&0xF)  | ((qh[l]>>2)&3)<<4) - 32)
+    //   y[l+64] = d*sc[4] * (((ql[l]>>4)      | ((qh[l]>>4)&3)<<4) - 32)
+    //   y[l+96] = d*sc[6] * (((ql[l+32]>>4)   | ((qh[l]>>6)&3)<<4) - 32)
+    // Then advance ql+=64, qh+=32, sc+=8 for second half.
+
     for (uint32_t bi = lane; bi < blocks_per_row; bi += 32) {
         const uint8_t *block = row_data + bi * Q6_K_BLOCK_SIZE;
-
-        const uint8_t *ql = block;            // 128 bytes: low 4 bits
-        const uint8_t *qh = block + 128;      // 64 bytes: high 2 bits
-        const int8_t *scales = (const int8_t *)(block + 192);  // 16 bytes
+        const uint8_t *ql = block;
+        const uint8_t *qh = block + 128;
+        const int8_t *sc = (const int8_t *)(block + 192);
         float d = __half2float(__ldg((const __half *)(block + 208)));
 
-        uint32_t x_base = bi << 8;  // bi * 256
+        uint32_t xb = bi << 8;
 
-        // 256 elements in 16 sub-blocks of 16
-        // ql layout: elements 0-127 use ql[0-127] low nibbles, elements 128-255 use high nibbles
-        // qh layout: 4 groups of 64, each qh byte holds 2 bits for 4 elements
+        for (int n = 0; n < 2; n++) {
+            const uint8_t *ql_n = ql + n * 64;
+            const uint8_t *qh_n = qh + n * 32;
+            float s0 = d * (float)sc[n*8+0], s2 = d * (float)sc[n*8+2];
+            float s4 = d * (float)sc[n*8+4], s6 = d * (float)sc[n*8+6];
+            uint32_t xi = xb + n * 128;
 
-        #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            float sc = d * (float)scales[j];
-            uint32_t base_idx = j * 16;
-            uint32_t xi = x_base + base_idx;
+            for (int l = 0; l < 32; l++) {
+                uint8_t ql0  = __ldg(&ql_n[l]);
+                uint8_t ql32 = __ldg(&ql_n[l + 32]);
+                uint8_t qhv  = __ldg(&qh_n[l]);
 
-            #pragma unroll
-            for (int k = 0; k < 16; k++) {
-                uint32_t elem = base_idx + k;
-                // Reconstruct 6-bit value
-                uint8_t ql_byte, ql_shift, qh_byte, qh_shift;
-                int q6;
+                int q0 = (int)((ql0  & 0xF) | (((qhv >> 0) & 3) << 4)) - 32;
+                int q1 = (int)((ql32 & 0xF) | (((qhv >> 2) & 3) << 4)) - 32;
+                int q2 = (int)((ql0  >> 4)  | (((qhv >> 4) & 3) << 4)) - 32;
+                int q3 = (int)((ql32 >> 4)  | (((qhv >> 6) & 3) << 4)) - 32;
 
-                if (elem < 128) {
-                    // Low half: ql[elem/2] low or high nibble
-                    ql_byte = __ldg(&ql[elem / 2]);
-                    ql_shift = (elem & 1) ? 4 : 0;
-                    // qh: qh[elem/4] bits ((elem%4)*2)..((elem%4)*2+1)
-                    qh_byte = __ldg(&qh[elem / 4]);
-                    qh_shift = (elem & 3) * 2;
-                } else {
-                    uint32_t e2 = elem - 128;
-                    ql_byte = __ldg(&ql[64 + e2 / 2]);
-                    ql_shift = (e2 & 1) ? 4 : 0;
-                    qh_byte = __ldg(&qh[32 + e2 / 4]);
-                    qh_shift = (e2 & 3) * 2;
-                }
-
-                q6 = ((ql_byte >> ql_shift) & 0xF) | (((qh_byte >> qh_shift) & 3) << 4);
-                acc += sc * (float)(q6 - 32) * x_shared[xi + k];
+                acc += s0 * (float)q0 * x_shared[xi + l];
+                acc += s2 * (float)q1 * x_shared[xi + l + 32];
+                acc += s4 * (float)q2 * x_shared[xi + l + 64];
+                acc += s6 * (float)q3 * x_shared[xi + l + 96];
             }
         }
     }

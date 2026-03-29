@@ -133,6 +133,7 @@ static int    g_gguf_up_type = 12;
 static size_t g_gguf_down_offset = 0;
 static size_t g_gguf_down_size = 0;
 static int    g_gguf_down_type = 14;  // Q6_K default
+static int    g_gguf_down_type_per_layer[256] = {0};  // per-layer down type (i1 quant mixes Q4_K/Q6_K)
 
 #define CHECK_CUDA(call) do { \
     cudaError_t err = (call); \
@@ -1053,13 +1054,6 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
             memset(model->cache_map, -1, sizeof(model->cache_map));
             model->vram_cache_used = 0;
             model->vram_cache_clock = 0;
-            // Debug: check for buffer overlap
-            uintptr_t cache_start = (uintptr_t)model->vram_cache_pool;
-            uintptr_t cache_end = cache_start + alloc;
-            uintptr_t hmid = (uintptr_t)model->buf_h_mid;
-            if (hmid >= cache_start && hmid < cache_end)
-                printf("[OVERLAP] buf_h_mid (%p) is INSIDE vram_cache_pool [%p, %p)!\n",
-                       (void*)hmid, (void*)cache_start, (void*)cache_end);
             printf("[init] VRAM expert cache: %d experts (%.1f GB), %.1f%% of total\n",
                    model->vram_cache_capacity,
                    alloc / (1024.0*1024*1024),
@@ -1347,25 +1341,20 @@ static inline void do_matvec(
     }
 }
 
-static void expert_forward(Model *model, int expert_slot, const float *input, float *output) {
+static void expert_forward(Model *model, int expert_slot, int layer_idx, const float *input, float *output) {
     if (g_quant_format == 1) {
-        // GGUF layout: gate_data + up_data + down_data, all contiguous
         uint8_t *base = (uint8_t *)model->buf_expert_data + expert_slot * g_expert_size;
-        // gate: type from layout.json
         launch_dequant_matvec_gguf((const void *)(base + g_gguf_gate_offset),
             input, model->buf_shared_gate, MOE_INTERMEDIATE, HIDDEN_DIM,
             g_gguf_gate_type);
-        // up: type from layout.json
         launch_dequant_matvec_gguf((const void *)(base + g_gguf_up_offset),
             input, model->buf_shared_up, MOE_INTERMEDIATE, HIDDEN_DIM,
             g_gguf_up_type);
-        // SwiGLU
         launch_swiglu(model->buf_shared_gate, model->buf_shared_up, model->buf_shared_gate,
                       MOE_INTERMEDIATE);
-        // down: type from layout.json
         launch_dequant_matvec_gguf((const void *)(base + g_gguf_down_offset),
             model->buf_shared_gate, output, HIDDEN_DIM, MOE_INTERMEDIATE,
-            g_gguf_down_type);
+            g_gguf_down_type_per_layer[layer_idx]);
     } else {
         // MLX affine 4-bit layout
         void *base = (char *)model->buf_expert_data + expert_slot * g_expert_size;
@@ -1817,7 +1806,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                           MOE_INTERMEDIATE);
             launch_dequant_matvec_gguf((const void *)(base + g_gguf_down_offset),
                 model->buf_shared_gate, model->buf_expert_outs + k * HIDDEN_DIM,
-                HIDDEN_DIM, MOE_INTERMEDIATE, g_gguf_down_type);
+                HIDDEN_DIM, MOE_INTERMEDIATE, g_gguf_down_type_per_layer[layer_idx]);
         } else {
             // MLX expert layout
             void *base = expert_ptrs[k];
@@ -3261,6 +3250,39 @@ int main(int argc, char **argv) {
                    g_gguf_gate_offset, g_gguf_gate_type,
                    g_gguf_up_offset, g_gguf_up_type,
                    g_gguf_down_offset, g_gguf_down_type);
+
+            // Parse per-layer down types from "layer_info" array
+            // Format: "layer_info": [{"down_type": 14, ...}, {"down_type": 12, ...}, ...]
+            const char *li = strstr(ljson, "\"layer_info\"");
+            if (li) {
+                int mixed = 0;
+                for (int i = 0; i < NUM_LAYERS && i < 256; i++) {
+                    g_gguf_down_type_per_layer[i] = g_gguf_down_type;  // default
+                    // Find the i-th "down_type" entry
+                    li = strstr(li + 1, "\"down_type\"");
+                    if (li) {
+                        const char *c2 = strchr(li, ':');
+                        if (c2) {
+                            int t = atoi(c2 + 1);
+                            g_gguf_down_type_per_layer[i] = t;
+                            if (t != g_gguf_down_type) mixed = 1;
+                        }
+                    }
+                }
+                if (mixed) {
+                    int q4k = 0, q6k = 0;
+                    for (int i = 0; i < NUM_LAYERS; i++) {
+                        if (g_gguf_down_type_per_layer[i] == 12) q4k++;
+                        else q6k++;
+                    }
+                    printf("[init] Mixed expert quant: %d layers Q4_K down, %d layers Q6_K down\n",
+                           q4k, q6k);
+                }
+            } else {
+                // No layer_info: use uniform type
+                for (int i = 0; i < NUM_LAYERS && i < 256; i++)
+                    g_gguf_down_type_per_layer[i] = g_gguf_down_type;
+            }
             free(ljson);
         } else {
             fprintf(stderr, "WARNING: GGUF format but no %s found\n", layout_path);
