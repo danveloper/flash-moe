@@ -756,7 +756,43 @@ __global__ void conv1d_step(
 }
 
 // ============================================================================
-// 12. Per-head RMS norm for Q and K
+// 12a. Per-head L2 norm for Q and K (GGUF models — matches llama.cpp ggml_l2_norm)
+// ============================================================================
+
+__global__ void l2_norm_qk(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    uint32_t key_dim
+) {
+    uint32_t head = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t base = head * key_dim;
+
+    __shared__ float buf[128];
+
+    // Q L2 norm: q = q / ||q||
+    float qv = (tid < key_dim) ? q[base + tid] : 0.0f;
+    buf[tid] = qv * qv;
+    __syncthreads();
+    __shared__ float q_sum;
+    if (tid == 0) { float s = 0; for (uint32_t i = 0; i < key_dim; i++) s += buf[i]; q_sum = s; }
+    __syncthreads();
+    if (tid < key_dim)
+        q[base + tid] = qv * rsqrtf(q_sum + 1e-6f);
+
+    // K L2 norm: k = k / ||k||
+    float kv = (tid < key_dim) ? k[base + tid] : 0.0f;
+    buf[tid] = kv * kv;
+    __syncthreads();
+    __shared__ float k_sum;
+    if (tid == 0) { float s = 0; for (uint32_t i = 0; i < key_dim; i++) s += buf[i]; k_sum = s; }
+    __syncthreads();
+    if (tid < key_dim)
+        k[base + tid] = kv * rsqrtf(k_sum + 1e-6f);
+}
+
+// ============================================================================
+// 12b. Per-head RMS norm for Q and K (MLX models — original 397B behavior)
 // ============================================================================
 
 __global__ void rms_norm_qk(
@@ -794,6 +830,7 @@ __global__ void rms_norm_qk(
 // 13. Compute decay and beta gate for GatedDeltaNet
 // ============================================================================
 
+// MLX version: A_log stores log(A), compute exp(A_log) first, dt_bias is bf16
 __global__ void compute_decay_beta(
     const float* __restrict__ alpha_out,
     const float* __restrict__ beta_out,
@@ -809,6 +846,24 @@ __global__ void compute_decay_beta(
     float sp = logf(1.0f + expf(a_val + dt_b));
     g_decay[idx] = expf(-A_val * sp);
     beta_gate[idx] = 1.0f / (1.0f + expf(-beta_out[idx]));
+}
+
+// GGUF version: ssm_a is used directly as multiplier (= -exp(A_log) in HF convention),
+// dt_bias is bf16 (converted from F32 during upload), beta uses sigmoid
+__global__ void compute_decay_beta_gguf(
+    const float* __restrict__ alpha_out,
+    const float* __restrict__ beta_out,
+    const float* __restrict__ ssm_a,       // negative values, used directly
+    const uint16_t* __restrict__ dt_bias,  // bf16 (converted from F32)
+    float* __restrict__ g_decay,
+    float* __restrict__ beta_gate
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float a_val = alpha_out[idx];
+    float dt_b = bf16_to_f32(dt_bias[idx]);
+    float sp = logf(1.0f + expf(a_val + dt_b));  // softplus(alpha + dt_bias)
+    g_decay[idx] = expf(ssm_a[idx] * sp);         // exp(ssm_a * softplus) — ssm_a is negative
+    beta_gate[idx] = 1.0f / (1.0f + expf(-beta_out[idx]));  // sigmoid(beta)
 }
 
 // ============================================================================

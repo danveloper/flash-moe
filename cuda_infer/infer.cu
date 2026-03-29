@@ -1669,12 +1669,21 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             #undef DUMP5
         }
 
-        // RMS norm Q and K
-        float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
-        rms_norm_qk<<<LINEAR_NUM_K_HEADS, LINEAR_KEY_DIM>>>(
-            model->buf_conv_output,
-            model->buf_conv_output + LINEAR_TOTAL_KEY,  // k starts after q
-            LINEAR_KEY_DIM, inv_scale);
+        // Normalize Q and K
+        if (g_quant_format == 1) {
+            // GGUF: L2 normalization (matches llama.cpp ggml_l2_norm)
+            l2_norm_qk<<<LINEAR_NUM_K_HEADS, LINEAR_KEY_DIM>>>(
+                model->buf_conv_output,
+                model->buf_conv_output + LINEAR_TOTAL_KEY,
+                LINEAR_KEY_DIM);
+        } else {
+            // MLX: RMS norm with scaling (original 397B behavior)
+            float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
+            rms_norm_qk<<<LINEAR_NUM_K_HEADS, LINEAR_KEY_DIM>>>(
+                model->buf_conv_output,
+                model->buf_conv_output + LINEAR_TOTAL_KEY,
+                LINEAR_KEY_DIM, inv_scale);
+        }
 
         if (layer_idx == 0 && g_dump_layer0) {
             float d5[5];
@@ -1686,10 +1695,18 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         }
 
         // Compute decay and beta gate
-        compute_decay_beta<<<1, LINEAR_NUM_V_HEADS>>>(
-            model->buf_alpha_proj, model->buf_beta_proj,
-            L.A_log, L.dt_bias,
-            model->buf_g_decay, model->buf_beta_gate);
+        if (g_quant_format == 1) {
+            // GGUF: ssm_a is used directly (not exponentiated), dt_bias is bf16 (converted)
+            compute_decay_beta_gguf<<<1, LINEAR_NUM_V_HEADS>>>(
+                model->buf_alpha_proj, model->buf_beta_proj,
+                L.A_log, L.dt_bias,
+                model->buf_g_decay, model->buf_beta_gate);
+        } else {
+            compute_decay_beta<<<1, LINEAR_NUM_V_HEADS>>>(
+                model->buf_alpha_proj, model->buf_beta_proj,
+                L.A_log, L.dt_bias,
+                model->buf_g_decay, model->buf_beta_gate);
+        }
 
         if (layer_idx == 0 && g_dump_layer0) {
             float dd[5], db[5];
@@ -1964,9 +1981,9 @@ static int forward(Model *model, int token_id, int pos, int K) {
     // 60 layers
     for (int i = 0; i < NUM_LAYERS; i++) {
         layer_forward(model, i, pos, K);
-        // Dump hidden state every 5 layers (first token only)
+        // Dump hidden state every layer (first token only)
         static int layer_dump = 1;
-        if (layer_dump && g_quant_format == 1 && (i % 5 == 0 || i == NUM_LAYERS-1)) {
+        if (layer_dump && g_quant_format == 1) {
             float d5[5];
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaMemcpy(d5, model->buf_hidden, 5*sizeof(float), cudaMemcpyDeviceToHost));
@@ -2014,6 +2031,18 @@ static int forward(Model *model, int token_id, int pos, int K) {
     // Copy logits to host and argmax
     CHECK_CUDA(cudaMemcpy(model->h_logits, model->buf_logits,
                           VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Debug: save full logits to file for correlation analysis
+    static int logit_save = 1;
+    if (logit_save && g_quant_format == 1) {
+        FILE *lf = fopen("/tmp/cuda_logits_hello.bin", "wb");
+        if (lf) {
+            fwrite(model->h_logits, sizeof(float), VOCAB_SIZE, lf);
+            fclose(lf);
+            printf("[ref] Saved %d logits to /tmp/cuda_logits_hello.bin\n", VOCAB_SIZE);
+        }
+        logit_save = 0;
+    }
 
     // Debug: show top-10 logits for first token
     static int logit_dump = 1;
