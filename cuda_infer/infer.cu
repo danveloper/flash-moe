@@ -1654,6 +1654,16 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         do_matvec(L.a_w, L.a_s, L.a_b, model->buf_normed,
                   model->buf_alpha_proj, LINEAR_NUM_V_HEADS, HIDDEN_DIM, L.qt_a);
 
+        // Dump raw QKV before conv1d
+        if (layer_idx == 0 && g_dump_layer0) {
+            float d5[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_q_proj, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 raw_QKV[0:5]     %12.6f %12.6f %12.6f %12.6f %12.6f\n", d5[0],d5[1],d5[2],d5[3],d5[4]);
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_q_proj + 4096, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 raw_V[0:5]       %12.6f %12.6f %12.6f %12.6f %12.6f\n", d5[0],d5[1],d5[2],d5[3],d5[4]);
+        }
+
         // Conv1d step
         conv1d_step<<<(LINEAR_CONV_DIM + 255) / 256, 256>>>(
             model->conv_state[layer_idx], model->buf_q_proj,
@@ -1667,7 +1677,9 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
                 CHECK_CUDA(cudaMemcpy(d5, buf, 5*sizeof(float), cudaMemcpyDeviceToHost)); \
                 printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", name, d5[0],d5[1],d5[2],d5[3],d5[4]); \
             } while(0)
-            DUMP5("conv_out", model->buf_conv_output);
+            DUMP5("conv_Q[0:5]", model->buf_conv_output);
+            DUMP5("conv_K[0:5]", model->buf_conv_output + LINEAR_TOTAL_KEY);
+            DUMP5("conv_V[0:5]", model->buf_conv_output + 2 * LINEAR_TOTAL_KEY);
             DUMP5("z_proj", model->buf_z_proj);
             DUMP5("alpha", model->buf_alpha_proj);
             DUMP5("beta", model->buf_beta_proj);
@@ -1693,10 +1705,21 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         if (layer_idx == 0 && g_dump_layer0) {
             float d5[5];
             CHECK_CUDA(cudaDeviceSynchronize());
-            CHECK_CUDA(cudaMemcpy(d5, model->buf_conv_output, 5*sizeof(float), cudaMemcpyDeviceToHost));
-            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "q_normed", d5[0],d5[1],d5[2],d5[3],d5[4]);
-            CHECK_CUDA(cudaMemcpy(d5, model->buf_conv_output + LINEAR_TOTAL_KEY, 5*sizeof(float), cudaMemcpyDeviceToHost));
-            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "k_normed", d5[0],d5[1],d5[2],d5[3],d5[4]);
+            // Dump Q/K after L2 norm and V (raw, not normalized)
+            float *h_q128 = (float*)malloc(128*sizeof(float));
+            float *h_k128 = (float*)malloc(128*sizeof(float));
+            float *h_v5 = (float*)malloc(5*sizeof(float));
+            CHECK_CUDA(cudaMemcpy(h_q128, model->buf_conv_output, 128*sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(h_k128, model->buf_conv_output + LINEAR_TOTAL_KEY, 128*sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(h_v5, model->buf_conv_output + 2*LINEAR_TOTAL_KEY, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 q_normed[0:5]    %12.6f %12.6f %12.6f %12.6f %12.6f\n", h_q128[0],h_q128[1],h_q128[2],h_q128[3],h_q128[4]);
+            printf("[ref] L0 k_normed[0:5]    %12.6f %12.6f %12.6f %12.6f %12.6f\n", h_k128[0],h_k128[1],h_k128[2],h_k128[3],h_k128[4]);
+            printf("[ref] L0 V_raw[0:5]       %12.6f %12.6f %12.6f %12.6f %12.6f\n", h_v5[0],h_v5[1],h_v5[2],h_v5[3],h_v5[4]);
+            // Compute |q|^2 and |k|^2 for head 0
+            float q_sq = 0, k_sq = 0, qk_dot = 0;
+            for (int i = 0; i < 128; i++) { q_sq += h_q128[i]*h_q128[i]; k_sq += h_k128[i]*h_k128[i]; qk_dot += h_q128[i]*h_k128[i]; }
+            printf("[ref] L0 |q|^2=%.6f |k|^2=%.6f q.k=%.6f\n", q_sq, k_sq, qk_dot);
+            free(h_q128); free(h_k128); free(h_v5);
         }
 
         // Compute decay and beta gate
