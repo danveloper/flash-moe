@@ -228,6 +228,8 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t *q,
     }
 }
 
+// Q4_K matvec with Q8_K input quantization (matches llama.cpp vec_dot_q4_K_q8_K)
+// Shared memory layout: [in_dim floats for x] + [in_dim int8 for q8] + [in_dim/256 floats for q8_scales]
 __global__ void dequant_matvec_q4k(
     const uint8_t* __restrict__ W_q4k,
     const float*   __restrict__ x,
@@ -236,75 +238,96 @@ __global__ void dequant_matvec_q4k(
     uint32_t in_dim
 ) {
     extern __shared__ float x_shared[];
+    int8_t *q8_shared = (int8_t *)(x_shared + in_dim);
+    float *q8_scales = (float *)(q8_shared + in_dim);
+
     const uint32_t lane = threadIdx.x;
     const uint32_t warp_id = threadIdx.y;
     const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
     const uint32_t blocks_per_row = in_dim >> 8;  // in_dim / 256
-
     const uint32_t tid = warp_id * 32 + lane;
+
+    // Load x into shared memory
     for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
         x_shared[i] = x[i];
+    __syncthreads();
+
+    // Quantize x to Q8_K: per-256-element blocks
+    for (uint32_t bi = tid; bi < blocks_per_row; bi += (32 * ROWS_PER_BLOCK)) {
+        float max_abs = 0.0f;
+        for (uint32_t i = 0; i < 256; i++) {
+            float v = fabsf(x_shared[bi * 256 + i]);
+            if (v > max_abs) max_abs = v;
+        }
+        float scale = max_abs / 127.0f;
+        float inv_scale = (scale > 0) ? (1.0f / scale) : 0.0f;
+        q8_scales[bi] = scale;
+        for (uint32_t i = 0; i < 256; i++) {
+            float v = x_shared[bi * 256 + i] * inv_scale;
+            int q = __float2int_rn(v);
+            q8_shared[bi * 256 + i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
+        }
+    }
     __syncthreads();
 
     if (row >= out_dim) return;
 
     const uint8_t *row_data = W_q4k + (size_t)row * blocks_per_row * Q4_K_BLOCK_SIZE;
-
     float acc = 0.0f;
 
     for (uint32_t bi = lane; bi < blocks_per_row; bi += 32) {
         const uint8_t *block = row_data + bi * Q4_K_BLOCK_SIZE;
+        const uint8_t *qs = block + 16;
+        const uint8_t *sc_bytes = block + 4;
+        float d_w = __half2float(__ldg((const __half *)(block)));
+        float dmin_w = __half2float(__ldg((const __half *)(block + 2)));
+        float d_q8 = q8_scales[bi];
+        const int8_t *q8 = q8_shared + bi * 256;
 
-        // Load super-block header via __ldg
-        float d    = __half2float(__ldg((const __half *)(block)));
-        float dmin = __half2float(__ldg((const __half *)(block + 2)));
-        const uint8_t *sc_ptr = block + 4;
-        const uint32_t *qs32 = (const uint32_t *)(block + 16);  // 128 bytes = 32 uint32
-
-        uint32_t x_base = bi << 8;  // bi * 256
-
-        // Precompute all 8 scale/min pairs (no branch in inner loop)
-        float d1[8], m1[8];
-        #pragma unroll
+        // Dequant Q4_K into aux8 (matching vec_dot_q4_K_q8_K_generic)
+        // 4 pairs of 64: low nibbles then high nibbles
+        int8_t aux8[256];
+        int a = 0, q4_off = 0;
         for (int j = 0; j < 4; j++) {
-            d1[j] = d * (float)(sc_ptr[j] & 63);
-            m1[j] = dmin * (float)(sc_ptr[j + 4] & 63);
-        }
-        #pragma unroll
-        for (int j = 4; j < 8; j++) {
-            d1[j] = d * (float)((sc_ptr[j + 4] & 0xF) | ((sc_ptr[j - 4] >> 6) << 4));
-            m1[j] = dmin * (float)((sc_ptr[j + 4] >> 4) | ((sc_ptr[j] >> 6) << 4));
+            for (int l = 0; l < 32; l++) aux8[a + l] = (int8_t)(__ldg(&qs[q4_off + l]) & 0xF);
+            a += 32;
+            for (int l = 0; l < 32; l++) aux8[a + l] = (int8_t)(__ldg(&qs[q4_off + l]) >> 4);
+            a += 32;
+            q4_off += 32;
         }
 
-        // Process 4 pairs of sub-blocks (64 elements per pair)
-        // Matches GGML dequantize_row_q4_K element ordering:
-        //   32 low nibbles (scale d1[2j]) then 32 high nibbles (scale d1[2j+1])
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float ds1 = d1[2*j], ms1 = m1[2*j];
-            float ds2 = d1[2*j+1], ms2 = m1[2*j+1];
-            uint32_t xb = x_base + (j << 6);   // j * 64
-            uint32_t qs_off = j << 3;           // j * 8 (32 bytes = 8 uint32)
+        // Unpack scales using utmp/kmask approach (matching vec_dot)
+        uint32_t utmp[4];
+        utmp[0] = __ldg((const uint32_t *)(sc_bytes + 0));
+        utmp[1] = __ldg((const uint32_t *)(sc_bytes + 4));
+        utmp[2] = __ldg((const uint32_t *)(sc_bytes + 8));
+        utmp[3] = ((utmp[2] >> 4) & 0x0f0f0f0fu) | (((utmp[1] >> 6) & 0x03030303u) << 4);
+        uint32_t uaux = utmp[1] & 0x3f3f3f3fu;
+        utmp[1] = (utmp[2] & 0x0f0f0f0fu) | (((utmp[0] >> 6) & 0x03030303u) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= 0x3f3f3f3fu;
+        const uint8_t *scales = (const uint8_t *)&utmp[0];
+        const uint8_t *mins = (const uint8_t *)&utmp[2];
 
-            #pragma unroll
-            for (int b = 0; b < 8; b++) {
-                uint32_t qw = __ldg(qs32 + qs_off + b);
-                uint32_t xi_lo = xb + b * 4;
-                uint32_t xi_hi = xb + 32 + b * 4;
-                float xl0 = x_shared[xi_lo], xl1 = x_shared[xi_lo+1];
-                float xl2 = x_shared[xi_lo+2], xl3 = x_shared[xi_lo+3];
-                float xh0 = x_shared[xi_hi], xh1 = x_shared[xi_hi+1];
-                float xh2 = x_shared[xi_hi+2], xh3 = x_shared[xi_hi+3];
-                acc += __fmaf_rn((float)((qw >>  0) & 0xF), ds1 * xl0, -ms1 * xl0);
-                acc += __fmaf_rn((float)((qw >>  8) & 0xF), ds1 * xl1, -ms1 * xl1);
-                acc += __fmaf_rn((float)((qw >> 16) & 0xF), ds1 * xl2, -ms1 * xl2);
-                acc += __fmaf_rn((float)((qw >> 24) & 0xF), ds1 * xl3, -ms1 * xl3);
-                acc += __fmaf_rn((float)((qw >>  4) & 0xF), ds2 * xh0, -ms2 * xh0);
-                acc += __fmaf_rn((float)((qw >> 12) & 0xF), ds2 * xh1, -ms2 * xh1);
-                acc += __fmaf_rn((float)((qw >> 20) & 0xF), ds2 * xh2, -ms2 * xh2);
-                acc += __fmaf_rn((float)((qw >> 28) & 0xF), ds2 * xh3, -ms2 * xh3);
-            }
+        // Compute bsums (sum of q8 per 16-element group)
+        int sumi = 0;
+        for (int j = 0; j < 16; j++) {
+            int bsum = 0;
+            for (int l = 0; l < 16; l++) bsum += q8[j * 16 + l];
+            sumi += bsum * (int)mins[j / 2];
         }
+
+        // Integer dot product (matching vec_dot inner loop)
+        int32_t aux32 = 0;
+        int ai = 0, is = 0;
+        for (int j = 0; j < 8; j++) {
+            int sc = scales[is++];
+            for (int l = 0; l < 32; l++)
+                aux32 += sc * (int)q8[ai + l] * (int)aux8[ai + l];
+            ai += 32;
+        }
+
+        acc += d_w * d_q8 * (float)aux32 - dmin_w * d_q8 * (float)sumi;
     }
 
     acc = warp_reduce_sum(acc);
@@ -318,7 +341,8 @@ static inline void launch_dequant_matvec_q4k(
 ) {
     dim3 block(32, ROWS_PER_BLOCK);
     dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
-    size_t smem = in_dim * sizeof(float);
+    // Shared memory: float x[in_dim] + int8 q8[in_dim] + float scales[in_dim/256]
+    size_t smem = in_dim * sizeof(float) + in_dim * sizeof(int8_t) + (in_dim / 256) * sizeof(float);
     dequant_matvec_q4k<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
 }
 
@@ -336,6 +360,8 @@ static inline void launch_dequant_matvec_q4k(
 
 #define Q5_K_BLOCK_SIZE 176  // 2+2+12+32+128 bytes
 
+// Q5_K matvec with Q8_K input quantization (matches llama.cpp vec_dot_q5_K_q8_K)
+// Shared memory layout: [in_dim floats for x] + [in_dim int8 for q8] + [in_dim/256 floats for q8_scales]
 __global__ void dequant_matvec_q5k(
     const uint8_t* __restrict__ W_q5k,
     const float*   __restrict__ x,
@@ -344,14 +370,37 @@ __global__ void dequant_matvec_q5k(
     uint32_t in_dim
 ) {
     extern __shared__ float x_shared[];
+    // Layout shared mem: [in_dim float] then [in_dim int8] then [in_dim/256 float scales]
+    int8_t *q8_shared = (int8_t *)(x_shared + in_dim);
+    float *q8_scales = (float *)(q8_shared + in_dim);
+
     const uint32_t lane = threadIdx.x;
     const uint32_t warp_id = threadIdx.y;
     const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
     const uint32_t blocks_per_row = in_dim >> 8;
-
     const uint32_t tid = warp_id * 32 + lane;
+
+    // Load x into shared memory
     for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
         x_shared[i] = x[i];
+    __syncthreads();
+
+    // Quantize x to Q8_K: per-256-element blocks
+    for (uint32_t bi = tid; bi < blocks_per_row; bi += (32 * ROWS_PER_BLOCK)) {
+        float max_abs = 0.0f;
+        for (uint32_t i = 0; i < 256; i++) {
+            float v = fabsf(x_shared[bi * 256 + i]);
+            if (v > max_abs) max_abs = v;
+        }
+        float scale = max_abs / 127.0f;
+        float inv_scale = (scale > 0) ? (1.0f / scale) : 0.0f;
+        q8_scales[bi] = scale;
+        for (uint32_t i = 0; i < 256; i++) {
+            float v = x_shared[bi * 256 + i] * inv_scale;
+            int q = __float2int_rn(v);
+            q8_shared[bi * 256 + i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
+        }
+    }
     __syncthreads();
 
     if (row >= out_dim) return;
@@ -361,67 +410,60 @@ __global__ void dequant_matvec_q5k(
 
     for (uint32_t bi = lane; bi < blocks_per_row; bi += 32) {
         const uint8_t *block = row_data + bi * Q5_K_BLOCK_SIZE;
+        const uint8_t *qs = block + 48;
+        const uint8_t *qh = block + 16;
+        const uint8_t *sc_bytes = block + 4;
+        float d_w = __half2float(__ldg((const __half *)(block)));
+        float dmin_w = __half2float(__ldg((const __half *)(block + 2)));
+        float d_q8 = q8_scales[bi];
+        const int8_t *q8 = q8_shared + bi * 256;
 
-        float d    = __half2float(__ldg((const __half *)(block)));
-        float dmin = __half2float(__ldg((const __half *)(block + 2)));
-        const uint8_t *sc_ptr = block + 4;    // 12 bytes scales
-        const uint8_t *qh = block + 16;       // 32 bytes high bits
-        const uint32_t *qs32 = (const uint32_t *)(block + 48);  // 128 bytes = 32 uint32
-
-        uint32_t x_base = bi << 8;
-
-        // Precompute all 8 scale/min pairs (same packing as Q4_K)
-        float sc_d[8], sc_m[8];
-        #pragma unroll
+        // Dequant Q5K into aux8 (matching vec_dot_q5_K_q8_K_generic)
+        int8_t aux8[256];
+        uint8_t m = 1;
+        int a = 0, q4_off = 0;
         for (int j = 0; j < 4; j++) {
-            sc_d[j] = d * (float)(sc_ptr[j] & 63);
-            sc_m[j] = dmin * (float)(sc_ptr[j + 4] & 63);
+            for (int l = 0; l < 32; l++) aux8[a + l] = qs[q4_off + l] & 0xF;
+            for (int l = 0; l < 32; l++) aux8[a + l] += (__ldg(&qh[l]) & m) ? 16 : 0;
+            a += 32; m <<= 1;
+            for (int l = 0; l < 32; l++) aux8[a + l] = qs[q4_off + l] >> 4;
+            for (int l = 0; l < 32; l++) aux8[a + l] += (__ldg(&qh[l]) & m) ? 16 : 0;
+            a += 32; m <<= 1;
+            q4_off += 32;
         }
-        #pragma unroll
-        for (int j = 4; j < 8; j++) {
-            sc_d[j] = d * (float)((sc_ptr[j + 4] & 0xF) | ((sc_ptr[j - 4] >> 6) << 4));
-            sc_m[j] = dmin * (float)((sc_ptr[j + 4] >> 4) | ((sc_ptr[j] >> 6) << 4));
+
+        // Unpack scales using utmp/kmask approach (matching vec_dot)
+        uint32_t utmp[4];
+        utmp[0] = __ldg((const uint32_t *)(sc_bytes + 0));
+        utmp[1] = __ldg((const uint32_t *)(sc_bytes + 4));
+        utmp[2] = __ldg((const uint32_t *)(sc_bytes + 8));
+        utmp[3] = ((utmp[2] >> 4) & 0x0f0f0f0fu) | (((utmp[1] >> 6) & 0x03030303u) << 4);
+        uint32_t uaux = utmp[1] & 0x3f3f3f3fu;
+        utmp[1] = (utmp[2] & 0x0f0f0f0fu) | (((utmp[0] >> 6) & 0x03030303u) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= 0x3f3f3f3fu;
+        const uint8_t *scales = (const uint8_t *)&utmp[0];
+        const uint8_t *mins = (const uint8_t *)&utmp[2];
+
+        // Compute bsums (sum of q8 per 16-element group)
+        int sumi = 0;
+        for (int j = 0; j < 16; j++) {
+            int bsum = 0;
+            for (int l = 0; l < 16; l++) bsum += q8[j * 16 + l];
+            sumi += bsum * (int)mins[j / 2];
         }
 
-        // Process 4 pairs of 64 elements matching GGML dequantize_row_q5_K:
-        //   Low 32 nibbles use scale[2j], high 32 use scale[2j+1]
-        //   5th bit from qh: u1 mask for low, u2 mask for high, shifting per pair
-        uint8_t u1 = 1, u2 = 2;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float ds1 = sc_d[2*j], ms1 = sc_m[2*j];
-            float ds2 = sc_d[2*j+1], ms2 = sc_m[2*j+1];
-            uint32_t xb = x_base + (j << 6);   // j * 64
-            uint32_t qs_off = j << 3;           // j * 8 uint32 = 32 bytes
-            int shift1 = j;          // bit shift for u1: (is/2) where is = 2*j
-            int shift2 = j + 1;      // bit shift for u2: (is/2 + 1)
-
-            #pragma unroll
-            for (int b = 0; b < 8; b++) {
-                uint32_t qw = __ldg(qs32 + qs_off + b);
-                uint32_t xi_lo = xb + b * 4;
-                uint32_t xi_hi = xb + 32 + b * 4;
-
-                #pragma unroll
-                for (int k = 0; k < 4; k++) {
-                    int l = b * 4 + k;  // element index 0..31 within this pair
-                    uint8_t qh_byte = __ldg(&qh[l]);
-                    uint8_t hi_lo = ((qh_byte & u1) >> shift1);  // 5th bit for low nibble element
-                    uint8_t hi_hi = ((qh_byte & u2) >> shift2);  // 5th bit for high nibble element
-
-                    uint32_t lo4 = (qw >> (k * 8)) & 0xF;
-                    uint32_t hi4 = (qw >> (k * 8 + 4)) & 0xF;
-
-                    float val_lo = (float)(lo4 | (hi_lo << 4));
-                    float val_hi = (float)(hi4 | (hi_hi << 4));
-
-                    acc += __fmaf_rn(val_lo, ds1 * x_shared[xi_lo + k], -ms1 * x_shared[xi_lo + k]);
-                    acc += __fmaf_rn(val_hi, ds2 * x_shared[xi_hi + k], -ms2 * x_shared[xi_hi + k]);
-                }
-            }
-            u1 <<= 2;
-            u2 <<= 2;
+        // Integer dot product (matching vec_dot inner loop)
+        int32_t aux32 = 0;
+        int ai = 0, is = 0;
+        for (int j = 0; j < 8; j++) {
+            int sc = scales[is++];
+            for (int l = 0; l < 32; l++)
+                aux32 += sc * (int)q8[ai + l] * (int)aux8[ai + l];
+            ai += 32;
         }
+
+        acc += d_w * d_q8 * (float)aux32 - dmin_w * d_q8 * (float)sumi;
     }
 
     acc = warp_reduce_sum(acc);
@@ -434,7 +476,8 @@ static inline void launch_dequant_matvec_q5k(
 ) {
     dim3 block(32, ROWS_PER_BLOCK);
     dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
-    size_t smem = in_dim * sizeof(float);
+    // Shared memory: float x[in_dim] + int8 q8[in_dim] + float scales[in_dim/256]
+    size_t smem = in_dim * sizeof(float) + in_dim * sizeof(int8_t) + (in_dim / 256) * sizeof(float);
     dequant_matvec_q5k<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
 }
 
@@ -933,6 +976,8 @@ static inline void launch_dequant_matvec(
 
 #define Q6_K_BLOCK_SIZE 210  // 128+64+16+2 bytes
 
+// Q6_K matvec with Q8_K input quantization (matches llama.cpp vec_dot_q6_K_q8_K)
+// Shared memory layout: [in_dim floats for x] + [in_dim int8 for q8] + [in_dim/256 floats for q8_scales]
 __global__ void dequant_matvec_q6k(
     const uint8_t* __restrict__ W_q6k,
     const float*   __restrict__ x,
@@ -941,14 +986,36 @@ __global__ void dequant_matvec_q6k(
     uint32_t in_dim
 ) {
     extern __shared__ float x_shared[];
+    int8_t *q8_shared = (int8_t *)(x_shared + in_dim);
+    float *q8_scales = (float *)(q8_shared + in_dim);
+
     const uint32_t lane = threadIdx.x;
     const uint32_t warp_id = threadIdx.y;
     const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
     const uint32_t blocks_per_row = in_dim >> 8;  // in_dim / 256
-
     const uint32_t tid = warp_id * 32 + lane;
+
+    // Load x into shared memory
     for (uint32_t i = tid; i < in_dim; i += (32 * ROWS_PER_BLOCK))
         x_shared[i] = x[i];
+    __syncthreads();
+
+    // Quantize x to Q8_K: per-256-element blocks
+    for (uint32_t bi = tid; bi < blocks_per_row; bi += (32 * ROWS_PER_BLOCK)) {
+        float max_abs = 0.0f;
+        for (uint32_t i = 0; i < 256; i++) {
+            float v = fabsf(x_shared[bi * 256 + i]);
+            if (v > max_abs) max_abs = v;
+        }
+        float scale = max_abs / 127.0f;
+        float inv_scale = (scale > 0) ? (1.0f / scale) : 0.0f;
+        q8_scales[bi] = scale;
+        for (uint32_t i = 0; i < 256; i++) {
+            float v = x_shared[bi * 256 + i] * inv_scale;
+            int q = __float2int_rn(v);
+            q8_shared[bi * 256 + i] = (int8_t)(q < -128 ? -128 : (q > 127 ? 127 : q));
+        }
+    }
     __syncthreads();
 
     if (row >= out_dim) return;
@@ -956,62 +1023,51 @@ __global__ void dequant_matvec_q6k(
     const uint8_t *row_data = W_q6k + (size_t)row * blocks_per_row * Q6_K_BLOCK_SIZE;
     float acc = 0.0f;
 
-    // Q6_K block layout (210 bytes = 128 + 64 + 16 + 2):
-    //   ql[128]: low 4 bits, 2 per byte
-    //   qh[64]:  high 2 bits, 4 per byte
-    //   scales[16]: int8 per-16-element scale
-    //   d: fp16 super-block scale
-    //
-    // GGML element ordering (from dequantize_row_q6_K):
-    //   For 2 halves of 128 elements each:
-    //     Half 0 (elements 0-127):  ql[0..63] low nibbles  + qh[0..31] bits 0-1
-    //     Half 1 (elements 128-255): ql[0..63] high nibbles + qh[0..31] bits 2-3
-    //   Within each half, 8 groups of 16:
-    //     group j (0-7): ql[j*8..j*8+7] provides 16 low nibbles (2 per byte)
-    //                    qh[j*4..j*4+3] provides high bits for 16 elements (4 per byte)
-
-    // Q6_K dequant follows ggml dequantize_row_q6_K exactly:
-    // Block = ql[128] + qh[64] + scales[16] + d(fp16)
-    // 2 halves of 128 elements, each half: 64 ql bytes, 32 qh bytes, 8 scales
-    // For l=0..31:
-    //   y[l+ 0] = d*sc[0] * (((ql[l]&0xF)    | ((qh[l]>>0)&3)<<4) - 32)
-    //   y[l+32] = d*sc[2] * (((ql[l+32]&0xF)  | ((qh[l]>>2)&3)<<4) - 32)
-    //   y[l+64] = d*sc[4] * (((ql[l]>>4)      | ((qh[l]>>4)&3)<<4) - 32)
-    //   y[l+96] = d*sc[6] * (((ql[l+32]>>4)   | ((qh[l]>>6)&3)<<4) - 32)
-    // Then advance ql+=64, qh+=32, sc+=8 for second half.
-
     for (uint32_t bi = lane; bi < blocks_per_row; bi += 32) {
         const uint8_t *block = row_data + bi * Q6_K_BLOCK_SIZE;
         const uint8_t *ql = block;
         const uint8_t *qh = block + 128;
         const int8_t *sc = (const int8_t *)(block + 192);
-        float d = __half2float(__ldg((const __half *)(block + 208)));
+        float d_w = __half2float(__ldg((const __half *)(block + 208)));
+        float d_q8 = q8_scales[bi];
+        const int8_t *q8 = q8_shared + bi * 256;
 
-        uint32_t xb = bi << 8;
-
-        for (int n = 0; n < 2; n++) {
-            const uint8_t *ql_n = ql + n * 64;
-            const uint8_t *qh_n = qh + n * 32;
-            float s0 = d * (float)sc[n*8+0], s2 = d * (float)sc[n*8+2];
-            float s4 = d * (float)sc[n*8+4], s6 = d * (float)sc[n*8+6];
-            uint32_t xi = xb + n * 128;
-
-            for (int l = 0; l < 32; l++) {
-                uint8_t ql0  = __ldg(&ql_n[l]);
-                uint8_t ql32 = __ldg(&ql_n[l + 32]);
-                uint8_t qhv  = __ldg(&qh_n[l]);
-
-                int q0 = (int)((ql0  & 0xF) | (((qhv >> 0) & 3) << 4)) - 32;
-                int q1 = (int)((ql32 & 0xF) | (((qhv >> 2) & 3) << 4)) - 32;
-                int q2 = (int)((ql0  >> 4)  | (((qhv >> 4) & 3) << 4)) - 32;
-                int q3 = (int)((ql32 >> 4)  | (((qhv >> 6) & 3) << 4)) - 32;
-
-                acc += s0 * (float)q0 * x_shared[xi + l];
-                acc += s2 * (float)q1 * x_shared[xi + l + 32];
-                acc += s4 * (float)q2 * x_shared[xi + l + 64];
-                acc += s6 * (float)q3 * x_shared[xi + l + 96];
+        // Dequant Q6_K into aux8 (matching vec_dot_q6_K_q8_K_generic)
+        // 2 halves of 128 elements: ql advances by 64, qh by 32 per half
+        // qh shifts are always 0,2,4,6 (reset each half)
+        int8_t aux8[256];
+        {
+            const uint8_t *q4 = ql;
+            const uint8_t *qh_p = qh;
+            int8_t *a = aux8;
+            for (int j = 0; j < 256; j += 128) {
+                for (int l = 0; l < 32; l++) {
+                    uint8_t qlv0  = __ldg(&q4[l]);
+                    uint8_t qlv32 = __ldg(&q4[l + 32]);
+                    uint8_t qhv   = __ldg(&qh_p[l]);
+                    a[l +  0] = (int8_t)(((qlv0  & 0xF) | (((qhv >> 0) & 3) << 4)) - 32);
+                    a[l + 32] = (int8_t)(((qlv32 & 0xF) | (((qhv >> 2) & 3) << 4)) - 32);
+                    a[l + 64] = (int8_t)(((qlv0  >> 4)  | (((qhv >> 4) & 3) << 4)) - 32);
+                    a[l + 96] = (int8_t)(((qlv32 >> 4)  | (((qhv >> 6) & 3) << 4)) - 32);
+                }
+                a += 128;
+                q4 += 64;
+                qh_p += 32;
             }
         }
+
+        // Integer dot product (matching vec_dot_q6_K_q8_K inner loop)
+        // 16 sub-blocks of 16 elements, each with int8 scale
+        int32_t aux32 = 0;
+        int ai = 0, is = 0;
+        for (int j = 0; j < 16; j++) {
+            int scale = sc[is++];
+            for (int l = 0; l < 16; l++)
+                aux32 += scale * (int)q8[ai + l] * (int)aux8[ai + l];
+            ai += 16;
+        }
+
+        acc += d_w * d_q8 * (float)aux32;
     }
 
     acc = warp_reduce_sum(acc);
@@ -1024,7 +1080,8 @@ static inline void launch_dequant_matvec_q6k(
 ) {
     dim3 block(32, ROWS_PER_BLOCK);
     dim3 grid((out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
-    size_t smem = in_dim * sizeof(float);
+    // Shared memory: float x[in_dim] + int8 q8[in_dim] + float scales[in_dim/256]
+    size_t smem = in_dim * sizeof(float) + in_dim * sizeof(int8_t) + (in_dim / 256) * sizeof(float);
     dequant_matvec_q6k<<<grid, block, smem, stream>>>(W, x, out, out_dim, in_dim);
 }
 
