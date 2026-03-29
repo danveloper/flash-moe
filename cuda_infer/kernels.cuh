@@ -370,62 +370,57 @@ __global__ void dequant_matvec_q5k(
 
         uint32_t x_base = bi << 8;
 
-        // Precompute scale/min pairs (same packing as Q4_K)
-        float d1[8], m1[8];
+        // Precompute all 8 scale/min pairs (same packing as Q4_K)
+        float sc_d[8], sc_m[8];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            d1[j] = d * (float)(sc_ptr[j] & 63);
-            m1[j] = dmin * (float)(sc_ptr[j + 4] & 63);
+            sc_d[j] = d * (float)(sc_ptr[j] & 63);
+            sc_m[j] = dmin * (float)(sc_ptr[j + 4] & 63);
         }
         #pragma unroll
         for (int j = 4; j < 8; j++) {
-            d1[j] = d * (float)((sc_ptr[j + 4] & 0xF) | ((sc_ptr[j - 4] >> 6) << 4));
-            m1[j] = dmin * (float)((sc_ptr[j + 4] >> 4) | ((sc_ptr[j] >> 6) << 4));
+            sc_d[j] = d * (float)((sc_ptr[j + 4] & 0xF) | ((sc_ptr[j - 4] >> 6) << 4));
+            sc_m[j] = dmin * (float)((sc_ptr[j + 4] >> 4) | ((sc_ptr[j] >> 6) << 4));
         }
 
-        // Process 8 sub-blocks of 32 elements
+        // Process 4 pairs of 64 elements matching GGML dequantize_row_q5_K:
+        //   Low 32 nibbles use scale[2j], high 32 use scale[2j+1]
+        //   5th bit from qh: u1 mask for low, u2 mask for high, shifting per pair
+        uint8_t u1 = 1, u2 = 2;
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            float ds = d1[j];
-            float ms = m1[j];
-            uint32_t xb = x_base + (j << 5);
-            uint32_t qs_off = j << 2;
-            // High-bit byte for this sub-block: qh[j*4 .. j*4+3]
-            uint32_t qh_word = __ldg((const uint32_t *)(qh + j * 4));
+        for (int j = 0; j < 4; j++) {
+            float ds1 = sc_d[2*j], ms1 = sc_m[2*j];
+            float ds2 = sc_d[2*j+1], ms2 = sc_m[2*j+1];
+            uint32_t xb = x_base + (j << 6);   // j * 64
+            uint32_t qs_off = j << 3;           // j * 8 uint32 = 32 bytes
+            int shift1 = j;          // bit shift for u1: (is/2) where is = 2*j
+            int shift2 = j + 1;      // bit shift for u2: (is/2 + 1)
 
-            uint32_t q0 = __ldg(qs32 + qs_off);
-            uint32_t q1 = __ldg(qs32 + qs_off + 1);
-            uint32_t q2 = __ldg(qs32 + qs_off + 2);
-            uint32_t q3 = __ldg(qs32 + qs_off + 3);
-
-            // Low nibbles (first 16 elements)
             #pragma unroll
-            for (int b = 0; b < 4; b++) {
-                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
-                uint32_t xi = xb + b * 4;
+            for (int b = 0; b < 8; b++) {
+                uint32_t qw = __ldg(qs32 + qs_off + b);
+                uint32_t xi_lo = xb + b * 4;
+                uint32_t xi_hi = xb + 32 + b * 4;
+
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    uint32_t elem_idx = b * 4 + k;
-                    uint32_t lo = (qw >> (k * 8)) & 0xF;
-                    uint32_t hi = (qh_word >> elem_idx) & 1;
-                    float val = (float)(lo | (hi << 4));
-                    acc += __fmaf_rn(val, ds * x_shared[xi + k], -ms * x_shared[xi + k]);
+                    int l = b * 4 + k;  // element index 0..31 within this pair
+                    uint8_t qh_byte = __ldg(&qh[l]);
+                    uint8_t hi_lo = ((qh_byte & u1) >> shift1);  // 5th bit for low nibble element
+                    uint8_t hi_hi = ((qh_byte & u2) >> shift2);  // 5th bit for high nibble element
+
+                    uint32_t lo4 = (qw >> (k * 8)) & 0xF;
+                    uint32_t hi4 = (qw >> (k * 8 + 4)) & 0xF;
+
+                    float val_lo = (float)(lo4 | (hi_lo << 4));
+                    float val_hi = (float)(hi4 | (hi_hi << 4));
+
+                    acc += __fmaf_rn(val_lo, ds1 * x_shared[xi_lo + k], -ms1 * x_shared[xi_lo + k]);
+                    acc += __fmaf_rn(val_hi, ds2 * x_shared[xi_hi + k], -ms2 * x_shared[xi_hi + k]);
                 }
             }
-            // High nibbles (next 16 elements)
-            #pragma unroll
-            for (int b = 0; b < 4; b++) {
-                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
-                uint32_t xi = xb + 16 + b * 4;
-                #pragma unroll
-                for (int k = 0; k < 4; k++) {
-                    uint32_t elem_idx = 16 + b * 4 + k;
-                    uint32_t lo = (qw >> (k * 8 + 4)) & 0xF;
-                    uint32_t hi = (qh_word >> elem_idx) & 1;
-                    float val = (float)(lo | (hi << 4));
-                    acc += __fmaf_rn(val, ds * x_shared[xi + k], -ms * x_shared[xi + k]);
-                }
-            }
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 
