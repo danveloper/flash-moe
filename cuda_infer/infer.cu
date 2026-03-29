@@ -1681,6 +1681,14 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             DUMP5("conv_K[0:5]", model->buf_conv_output + LINEAR_TOTAL_KEY);
             DUMP5("conv_V[0:5]", model->buf_conv_output + 2 * LINEAR_TOTAL_KEY);
             DUMP5("conv_V_h1[0:5]", model->buf_conv_output + 2 * LINEAR_TOTAL_KEY + 128);
+            // Save full conv output for comparison
+            {
+                float *cv = (float*)malloc(LINEAR_CONV_DIM * sizeof(float));
+                CHECK_CUDA(cudaMemcpy(cv, model->buf_conv_output, LINEAR_CONV_DIM * sizeof(float), cudaMemcpyDeviceToHost));
+                FILE *cf = fopen("/tmp/cuda_conv_silu.bin", "wb");
+                fwrite(cv, sizeof(float), LINEAR_CONV_DIM, cf);
+                fclose(cf); free(cv);
+            }
             DUMP5("z_proj", model->buf_z_proj);
             DUMP5("alpha", model->buf_alpha_proj);
             DUMP5("beta", model->buf_beta_proj);
@@ -1710,6 +1718,14 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             float *h_q128 = (float*)malloc(128*sizeof(float));
             float *h_k128 = (float*)malloc(128*sizeof(float));
             float *h_v5 = (float*)malloc(5*sizeof(float));
+            // Save full Q/K after L2 norm
+            {
+                float *qk = (float*)malloc(4096*sizeof(float));
+                CHECK_CUDA(cudaMemcpy(qk, model->buf_conv_output, 4096*sizeof(float), cudaMemcpyDeviceToHost));
+                FILE *f = fopen("/tmp/cuda_qk_normed.bin", "wb");
+                fwrite(qk, sizeof(float), 4096, f);
+                fclose(f); free(qk);
+            }
             CHECK_CUDA(cudaMemcpy(h_q128, model->buf_conv_output, 128*sizeof(float), cudaMemcpyDeviceToHost));
             CHECK_CUDA(cudaMemcpy(h_k128, model->buf_conv_output + LINEAR_TOTAL_KEY, 128*sizeof(float), cudaMemcpyDeviceToHost));
             CHECK_CUDA(cudaMemcpy(h_v5, model->buf_conv_output + 2*LINEAR_TOTAL_KEY, 5*sizeof(float), cudaMemcpyDeviceToHost));

@@ -734,7 +734,11 @@ __global__ void gated_delta_net_step(
 ) {
     uint32_t head_id = blockIdx.x;
     uint32_t vi = threadIdx.x;
-    uint32_t kh = head_id / k_heads_per_v;
+    // Key head mapping: modulo (matching llama.cpp iq1 = iv1 % neq1)
+    uint32_t num_k_heads = blockDim.x;  // HACK: pass via unused param
+    // Actually, num_k_heads = num_v_heads / k_heads_per_v
+    uint32_t n_kh = gridDim.x / k_heads_per_v;
+    uint32_t kh = head_id % n_kh;
     float g = g_decay[head_id];
     float beta = beta_gate[head_id];
 
@@ -760,6 +764,16 @@ __global__ void gated_delta_net_step(
     for (uint32_t ki = 0; ki < 128; ki++)
         out_val += state[state_base + ki] * q[k_base + ki];
     output[v_base + vi] = out_val;
+
+    // Debug: print head 1, vi=0 intermediate values
+    if (head_id == 1 && vi == 0) {
+        printf("[gdn] h1v0: g=%.6f beta=%.6f kv_mem=%.8f v=%.8f delta=%.8f out=%.8f\n",
+               g, beta, kv_mem, v[v_base], delta, out_val);
+        printf("[gdn] h1v0: q[0:3]=%.6f %.6f %.6f  k[0:3]=%.6f %.6f %.6f\n",
+               q[k_base], q[k_base+1], q[k_base+2], k[k_base], k[k_base+1], k[k_base+2]);
+        printf("[gdn] h1v0: state[0:3]=%.8f %.8f %.8f\n",
+               state[state_base], state[state_base+1], state[state_base+2]);
+    }
 }
 
 // ============================================================================
