@@ -1761,6 +1761,12 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaMemcpy(d5, model->buf_delta_output, 5*sizeof(float), cudaMemcpyDeviceToHost));
             printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "delta_out", d5[0],d5[1],d5[2],d5[3],d5[4]);
+            // Save full delta_out for per-head analysis
+            float *dt = (float*)malloc(LINEAR_TOTAL_VALUE * sizeof(float));
+            CHECK_CUDA(cudaMemcpy(dt, model->buf_delta_output, LINEAR_TOTAL_VALUE * sizeof(float), cudaMemcpyDeviceToHost));
+            FILE *df = fopen("/tmp/cuda_delta_out.bin", "wb");
+            fwrite(dt, sizeof(float), LINEAR_TOTAL_VALUE, df);
+            fclose(df); free(dt);
         }
 
         // Gated RMS norm
