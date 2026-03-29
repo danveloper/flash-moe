@@ -1459,6 +1459,7 @@ static FILE *g_expert_log = NULL;
 
 // Timing accumulator for per-phase breakdown
 static int g_timing_enabled = 0;
+static int g_dump_layer0 = 0;  // set to 1 for GGUF at startup
 static struct {
     double input_norm, attn_proj, attn_compute, oproj_residual;
     double routing, shared_expert, expert_io, expert_compute, combine;
@@ -1653,6 +1654,21 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             model->conv_state[layer_idx], model->buf_q_proj,
             L.conv1d_w, model->buf_conv_output, LINEAR_CONV_DIM);
 
+        // Dump layer 0 intermediates for comparison with Python reference
+        if (layer_idx == 0 && g_dump_layer0) {
+            float d5[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            #define DUMP5(name, buf) do { \
+                CHECK_CUDA(cudaMemcpy(d5, buf, 5*sizeof(float), cudaMemcpyDeviceToHost)); \
+                printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", name, d5[0],d5[1],d5[2],d5[3],d5[4]); \
+            } while(0)
+            DUMP5("conv_out", model->buf_conv_output);
+            DUMP5("z_proj", model->buf_z_proj);
+            DUMP5("alpha", model->buf_alpha_proj);
+            DUMP5("beta", model->buf_beta_proj);
+            #undef DUMP5
+        }
+
         // RMS norm Q and K
         float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
         rms_norm_qk<<<LINEAR_NUM_K_HEADS, LINEAR_KEY_DIM>>>(
@@ -1660,11 +1676,29 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             model->buf_conv_output + LINEAR_TOTAL_KEY,  // k starts after q
             LINEAR_KEY_DIM, inv_scale);
 
+        if (layer_idx == 0 && g_dump_layer0) {
+            float d5[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_conv_output, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "q_normed", d5[0],d5[1],d5[2],d5[3],d5[4]);
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_conv_output + LINEAR_TOTAL_KEY, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "k_normed", d5[0],d5[1],d5[2],d5[3],d5[4]);
+        }
+
         // Compute decay and beta gate
         compute_decay_beta<<<1, LINEAR_NUM_V_HEADS>>>(
             model->buf_alpha_proj, model->buf_beta_proj,
             L.A_log, L.dt_bias,
             model->buf_g_decay, model->buf_beta_gate);
+
+        if (layer_idx == 0 && g_dump_layer0) {
+            float dd[5], db[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(dd, model->buf_g_decay, 4*sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(db, model->buf_beta_gate, 4*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f\n", "decay", dd[0],dd[1],dd[2],dd[3]);
+            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f\n", "beta_gate", db[0],db[1],db[2],db[3]);
+        }
 
         // GatedDeltaNet recurrence
         uint32_t khpv = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;
@@ -1676,17 +1710,38 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
             model->buf_g_decay, model->buf_beta_gate,
             model->buf_delta_output, khpv);
 
+        if (layer_idx == 0 && g_dump_layer0) {
+            float d5[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_delta_output, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "delta_out", d5[0],d5[1],d5[2],d5[3],d5[4]);
+        }
+
         // Gated RMS norm
         gated_rms_norm<<<LINEAR_NUM_V_HEADS, LINEAR_VALUE_DIM>>>(
             model->buf_delta_output, model->buf_z_proj,
             L.gated_norm_w, model->buf_attn_out,
             LINEAR_VALUE_DIM, RMS_NORM_EPS);
 
+        if (layer_idx == 0 && g_dump_layer0) {
+            float d5[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_attn_out, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "gated_norm", d5[0],d5[1],d5[2],d5[3],d5[4]);
+        }
+
         // Output projection
         do_matvec(L.out_proj_w, L.out_proj_s, L.out_proj_b,
                   model->buf_attn_out, model->buf_h_mid,
                   HIDDEN_DIM, LINEAR_TOTAL_VALUE, L.qt_out);
 
+        if (layer_idx == 0 && g_dump_layer0) {
+            float d5[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_h_mid, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            printf("[ref] L0 %-15s %12.6f %12.6f %12.6f %12.6f %12.6f\n", "oproj_out", d5[0],d5[1],d5[2],d5[3],d5[4]);
+            g_dump_layer0 = 0;  // only dump once
+        }
     }
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.attn_compute += t1-t0; t0=t1; }
@@ -1909,6 +1964,17 @@ static int forward(Model *model, int token_id, int pos, int K) {
     // 60 layers
     for (int i = 0; i < NUM_LAYERS; i++) {
         layer_forward(model, i, pos, K);
+        // Dump hidden state every 5 layers (first token only)
+        static int layer_dump = 1;
+        if (layer_dump && g_quant_format == 1 && (i % 5 == 0 || i == NUM_LAYERS-1)) {
+            float d5[5];
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(d5, model->buf_hidden, 5*sizeof(float), cudaMemcpyDeviceToHost));
+            float mag = 0; for (int j = 0; j < 5; j++) mag += d5[j]*d5[j];
+            printf("[ref] L%02d hidden = %10.6f %10.6f %10.6f %10.6f %10.6f  mag=%.4f\n",
+                   i, d5[0],d5[1],d5[2],d5[3],d5[4], sqrtf(mag));
+            if (i == NUM_LAYERS-1) layer_dump = 0;
+        }
     }
 
     // Print timing summary
@@ -1924,6 +1990,18 @@ static int forward(Model *model, int token_id, int pos, int K) {
                 g_layer_timing.expert_compute/n, g_layer_timing.combine/n);
     }
 
+    // Dump final hidden state for comparison with llama.cpp
+    if (g_quant_format == 1) {
+        static int final_dump = 1;
+        if (final_dump) {
+        float d5[5];
+        CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_CUDA(cudaMemcpy(d5, model->buf_hidden, 5*sizeof(float), cudaMemcpyDeviceToHost));
+        printf("[ref] final_hidden[0:5] = %.6f %.6f %.6f %.6f %.6f\n", d5[0],d5[1],d5[2],d5[3],d5[4]);
+        printf("[ref] llama.cpp ref:      -1.087252 -2.072342 0.351115 3.771449 -0.681070\n");
+        final_dump = 0;
+    } }
+
     // Final RMS norm
     do_rms_norm(model->buf_hidden, model->final_norm_w, model->buf_normed,
                 HIDDEN_DIM, RMS_NORM_EPS);
@@ -1936,6 +2014,24 @@ static int forward(Model *model, int token_id, int pos, int K) {
     // Copy logits to host and argmax
     CHECK_CUDA(cudaMemcpy(model->h_logits, model->buf_logits,
                           VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Debug: show top-10 logits for first token
+    static int logit_dump = 1;
+    if (logit_dump && g_quant_format == 1) {
+        int top[10]; float topv[10];
+        for (int i = 0; i < 10; i++) { top[i] = i; topv[i] = model->h_logits[i]; }
+        for (int i = 10; i < VOCAB_SIZE; i++) {
+            int mn = 0;
+            for (int j = 1; j < 10; j++) if (topv[j] < topv[mn]) mn = j;
+            if (model->h_logits[i] > topv[mn]) { top[mn] = i; topv[mn] = model->h_logits[i]; }
+        }
+        // Sort by value
+        for (int i = 0; i < 9; i++) for (int j = i+1; j < 10; j++)
+            if (topv[j] > topv[i]) { float tv=topv[i]; topv[i]=topv[j]; topv[j]=tv; int ti=top[i]; top[i]=top[j]; top[j]=ti; }
+        printf("[ref] Top-10 logits:\n");
+        for (int i = 0; i < 10; i++) printf("  #%d: token %d = %.4f\n", i+1, top[i], topv[i]);
+        logit_dump = 0;
+    }
 
     int best = 0;
     float best_val = model->h_logits[0];
@@ -3231,6 +3327,7 @@ int main(int argc, char **argv) {
         (g_manifest_json && strstr(g_manifest_json, "\"quant_format\":\"gguf\""))) {
         g_quant_format = 1;
         printf("[init] GGUF weight format detected\n");
+        g_dump_layer0 = 1;
     }
 
     // Read expert layout for GGUF
