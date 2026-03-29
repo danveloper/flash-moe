@@ -813,7 +813,8 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.A_log", i);
                 model->layers[i].A_log = (float *)upload_tensor(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.dt_bias", i);
-                model->layers[i].dt_bias = (uint16_t *)upload_tensor_f32_as_bf16(wf, n, model->d_weights, &off);
+                // GGUF: keep dt_bias as F32 (store pointer in dt_bias field, kernel reads as F32)
+                model->layers[i].dt_bias = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.norm.weight", i);
                 model->layers[i].gated_norm_w = (uint16_t *)upload_tensor_f32_as_bf16(wf, n, model->d_weights, &off);
             }
@@ -1696,10 +1697,10 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
 
         // Compute decay and beta gate
         if (g_quant_format == 1) {
-            // GGUF: ssm_a is used directly (not exponentiated), dt_bias is bf16 (converted)
+            // GGUF: ssm_a and dt_bias are both F32
             compute_decay_beta_gguf<<<1, LINEAR_NUM_V_HEADS>>>(
                 model->buf_alpha_proj, model->buf_beta_proj,
-                L.A_log, L.dt_bias,
+                L.A_log, (const float *)L.dt_bias,
                 model->buf_g_decay, model->buf_beta_gate);
         } else {
             compute_decay_beta<<<1, LINEAR_NUM_V_HEADS>>>(

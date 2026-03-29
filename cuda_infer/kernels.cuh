@@ -848,19 +848,18 @@ __global__ void compute_decay_beta(
     beta_gate[idx] = 1.0f / (1.0f + expf(-beta_out[idx]));
 }
 
-// GGUF version: ssm_a is used directly as multiplier (= -exp(A_log) in HF convention),
-// dt_bias is bf16 (converted from F32 during upload), beta uses sigmoid
+// GGUF version: ssm_a and dt_bias are both F32
 __global__ void compute_decay_beta_gguf(
     const float* __restrict__ alpha_out,
     const float* __restrict__ beta_out,
     const float* __restrict__ ssm_a,       // negative values, used directly
-    const uint16_t* __restrict__ dt_bias,  // bf16 (converted from F32)
+    const float* __restrict__ dt_bias,     // F32 (not converted to bf16)
     float* __restrict__ g_decay,
     float* __restrict__ beta_gate
 ) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     float a_val = alpha_out[idx];
-    float dt_b = bf16_to_f32(dt_bias[idx]);
+    float dt_b = dt_bias[idx];
     float sp = logf(1.0f + expf(a_val + dt_b));  // softplus(alpha + dt_bias)
     g_decay[idx] = expf(ssm_a[idx] * sp);         // exp(ssm_a * softplus) — ssm_a is negative
     beta_gate[idx] = 1.0f / (1.0f + expf(-beta_out[idx]));  // sigmoid(beta)
