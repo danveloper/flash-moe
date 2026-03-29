@@ -660,6 +660,31 @@ static void *upload_tensor(WeightFile *wf, const char *name, void *d_base, size_
     return dst;
 }
 
+// Upload F32 tensor data as BF16 (for GGUF: norms, dt_bias, etc. are F32 but kernels expect bf16)
+static void *upload_tensor_f32_as_bf16(WeightFile *wf, const char *name, void *d_base, size_t *d_offset) {
+    TensorInfo *t = find_tensor(wf, name);
+    size_t t_offset = 0, t_size = 0;
+    if (t) { t_offset = t->offset; t_size = t->size; }
+    else if (find_tensor_in_json(name, &t_offset, &t_size)) {}
+    else { fprintf(stderr, "WARNING: tensor '%s' not found\n", name); return NULL; }
+
+    // Convert F32 → BF16 on CPU
+    size_t n_floats = t_size / sizeof(float);
+    const float *src = (const float *)((char *)wf->data + t_offset);
+    uint16_t *bf16_buf = (uint16_t *)malloc(n_floats * sizeof(uint16_t));
+    for (size_t i = 0; i < n_floats; i++) {
+        uint32_t bits;
+        memcpy(&bits, &src[i], 4);
+        bf16_buf[i] = (uint16_t)(bits >> 16);  // F32 → BF16: take upper 16 bits
+    }
+    void *dst = (char *)d_base + *d_offset;
+    size_t bf16_size = n_floats * sizeof(uint16_t);
+    CHECK_CUDA(cudaMemcpy(dst, bf16_buf, bf16_size, cudaMemcpyHostToDevice));
+    free(bf16_buf);
+    *d_offset += (bf16_size + 63) & ~63ULL;
+    return dst;
+}
+
 // Helper macro for uploading weight triplets (weight, scales, biases)
 #define UPLOAD_WEIGHT_TRIPLET(prefix, w_field, s_field, b_field) do { \
     char _n[256]; \
@@ -759,11 +784,11 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
                 { snprintf(n, sizeof(n), "model.layers.%d.self_attn.o_proj.weight", i);
                   model->layers[i].qt_o = lookup_gguf_type(wf, n); }
 
-                // Q/K norms
+                // Q/K norms (F32 in GGUF → convert to bf16)
                 snprintf(n, sizeof(n), "model.layers.%d.self_attn.q_norm.weight", i);
-                model->layers[i].q_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                model->layers[i].q_norm_w = (uint16_t *)upload_tensor_f32_as_bf16(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.self_attn.k_norm.weight", i);
-                model->layers[i].k_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                model->layers[i].k_norm_w = (uint16_t *)upload_tensor_f32_as_bf16(wf, n, model->d_weights, &off);
             } else {
                 UPLOAD_LAYER_SINGLE(i, "linear_attn.in_proj_qkv", qkv_w);
                 { snprintf(n, sizeof(n), "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
@@ -781,14 +806,15 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
                 { snprintf(n, sizeof(n), "model.layers.%d.linear_attn.out_proj.weight", i);
                   model->layers[i].qt_out = lookup_gguf_type(wf, n); }
 
+                // F32 tensors that kernels read as bf16 — convert during upload
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.conv1d.weight", i);
-                model->layers[i].conv1d_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                model->layers[i].conv1d_w = (uint16_t *)upload_tensor_f32_as_bf16(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.A_log", i);
                 model->layers[i].A_log = (float *)upload_tensor(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.dt_bias", i);
-                model->layers[i].dt_bias = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                model->layers[i].dt_bias = (uint16_t *)upload_tensor_f32_as_bf16(wf, n, model->d_weights, &off);
                 snprintf(n, sizeof(n), "model.layers.%d.linear_attn.norm.weight", i);
-                model->layers[i].gated_norm_w = (uint16_t *)upload_tensor(wf, n, model->d_weights, &off);
+                model->layers[i].gated_norm_w = (uint16_t *)upload_tensor_f32_as_bf16(wf, n, model->d_weights, &off);
             }
 
             // MoE routing + shared expert (all layers)
@@ -1008,9 +1034,13 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
         int skip_cache = (getenv("DISABLE_VRAM_CACHE") != NULL);
         size_t free_mem, total_mem;
         CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
-        size_t reserve = 512ULL * 1024 * 1024;  // keep 512MB free
+        size_t reserve = 1024ULL * 1024 * 1024;  // keep 1GB free for safety
         size_t cache_bytes = (free_mem > reserve && !skip_cache) ? free_mem - reserve : 0;
         model->vram_cache_capacity = (int)(cache_bytes / g_expert_size);
+        // Cap at total expert count (no point caching more than exist)
+        int total_experts = NUM_LAYERS * NUM_EXPERTS;
+        if (model->vram_cache_capacity > total_experts)
+            model->vram_cache_capacity = total_experts;
         if (model->vram_cache_capacity > 0) {
             size_t alloc = (size_t)model->vram_cache_capacity * g_expert_size;
             CHECK_CUDA(cudaMalloc(&model->vram_cache_pool, alloc));
@@ -1023,6 +1053,13 @@ static Model *model_init(WeightFile *wf, const char *expert_dir, int K) {
             memset(model->cache_map, -1, sizeof(model->cache_map));
             model->vram_cache_used = 0;
             model->vram_cache_clock = 0;
+            // Debug: check for buffer overlap
+            uintptr_t cache_start = (uintptr_t)model->vram_cache_pool;
+            uintptr_t cache_end = cache_start + alloc;
+            uintptr_t hmid = (uintptr_t)model->buf_h_mid;
+            if (hmid >= cache_start && hmid < cache_end)
+                printf("[OVERLAP] buf_h_mid (%p) is INSIDE vram_cache_pool [%p, %p)!\n",
+                       (void*)hmid, (void*)cache_start, (void*)cache_end);
             printf("[init] VRAM expert cache: %d experts (%.1f GB), %.1f%% of total\n",
                    model->vram_cache_capacity,
                    alloc / (1024.0*1024*1024),
@@ -1616,6 +1653,7 @@ static void layer_forward(Model *model, int layer_idx, int pos, int K) {
         do_matvec(L.out_proj_w, L.out_proj_s, L.out_proj_b,
                   model->buf_attn_out, model->buf_h_mid,
                   HIDDEN_DIM, LINEAR_TOTAL_VALUE, L.qt_out);
+
     }
 
     if (g_timing_enabled) { CHECK_CUDA(cudaDeviceSynchronize()); t1 = now_ms(); g_layer_timing.attn_compute += t1-t0; t0=t1; }
