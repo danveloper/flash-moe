@@ -1155,20 +1155,24 @@ static void embed_token(Model *model, int token_id) {
                     const uint8_t *sc = block + 4;
                     const uint8_t *qs = block + 16;
 
-                    for (int j = 0; j < 8; j++) {
-                        float ds, ms;
-                        if (j < 4) {
-                            ds = d_val * (float)(sc[j] & 63);
-                            ms = dmin_val * (float)(sc[j + 4] & 63);
-                        } else {
-                            ds = d_val * (float)((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4));
-                            ms = dmin_val * (float)((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4));
-                        }
-                        for (int l = 0; l < 16; l++) {
-                            h_embed[bi * 256 + j * 32 + l] = ds * (float)(qs[j * 16 + l] & 0xF) - ms;
-                        }
-                        for (int l = 0; l < 16; l++) {
-                            h_embed[bi * 256 + j * 32 + 16 + l] = ds * (float)(qs[j * 16 + l] >> 4) - ms;
+                    // Q4_K dequant matching GGML dequantize_row_q4_K:
+                    // 4 iterations of 64 elements (2 sub-blocks per iteration)
+                    // Low 32 nibbles use scale[2j], high 32 nibbles use scale[2j+1]
+                    for (int j = 0; j < 4; j++) {
+                        // Get scales for this pair of sub-blocks
+                        int is0 = 2 * j, is1 = 2 * j + 1;
+                        float d1, m1, d2, m2;
+                        // Scale unpacking (same get_scale_min_k4 logic)
+                        if (is0 < 4) { d1 = d_val*(sc[is0]&63); m1 = dmin_val*(sc[is0+4]&63); }
+                        else { d1 = d_val*((sc[is0+4]&0xF)|((sc[is0-4]>>6)<<4)); m1 = dmin_val*((sc[is0+4]>>4)|((sc[is0]>>6)<<4)); }
+                        if (is1 < 4) { d2 = d_val*(sc[is1]&63); m2 = dmin_val*(sc[is1+4]&63); }
+                        else { d2 = d_val*((sc[is1+4]&0xF)|((sc[is1-4]>>6)<<4)); m2 = dmin_val*((sc[is1+4]>>4)|((sc[is1]>>6)<<4)); }
+
+                        const uint8_t *q = qs + 32 * j;
+                        float *y = h_embed + bi * 256 + 64 * j;
+                        for (int l = 0; l < 32; l++) {
+                            y[l + 0]  = d1 * (float)(q[l] & 0xF) - m1;
+                            y[l + 32] = d2 * (float)(q[l] >> 4) - m2;
                         }
                     }
                 }

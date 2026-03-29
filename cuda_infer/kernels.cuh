@@ -276,43 +276,33 @@ __global__ void dequant_matvec_q4k(
             m1[j] = dmin * (float)((sc_ptr[j + 4] >> 4) | ((sc_ptr[j] >> 6) << 4));
         }
 
-        // Process 8 sub-blocks of 32 elements, 4 uint32 loads per sub-block
+        // Process 4 pairs of sub-blocks (64 elements per pair)
+        // Matches GGML dequantize_row_q4_K element ordering:
+        //   32 low nibbles (scale d1[2j]) then 32 high nibbles (scale d1[2j+1])
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            float ds = d1[j];
-            float ms = m1[j];
-            uint32_t xb = x_base + (j << 5);  // j * 32
-            uint32_t qs_off = j << 2;          // j * 4 (in uint32 units)
+        for (int j = 0; j < 4; j++) {
+            float ds1 = d1[2*j], ms1 = m1[2*j];
+            float ds2 = d1[2*j+1], ms2 = m1[2*j+1];
+            uint32_t xb = x_base + (j << 6);   // j * 64
+            uint32_t qs_off = j << 3;           // j * 8 (32 bytes = 8 uint32)
 
-            // Load 16 bytes (4 uint32) = 32 nibbles via __ldg
-            uint32_t q0 = __ldg(qs32 + qs_off);
-            uint32_t q1 = __ldg(qs32 + qs_off + 1);
-            uint32_t q2 = __ldg(qs32 + qs_off + 2);
-            uint32_t q3 = __ldg(qs32 + qs_off + 3);
-
-            // Low nibbles (first 16 elements) — FMA: fma(nibble, ds*x, -ms*x)
             #pragma unroll
-            for (int b = 0; b < 4; b++) {
-                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
-                uint32_t xi = xb + b * 4;
-                float x0 = x_shared[xi+0], x1 = x_shared[xi+1];
-                float x2 = x_shared[xi+2], x3 = x_shared[xi+3];
-                acc += __fmaf_rn((float)((qw >>  0) & 0xF), ds * x0, -ms * x0);
-                acc += __fmaf_rn((float)((qw >>  8) & 0xF), ds * x1, -ms * x1);
-                acc += __fmaf_rn((float)((qw >> 16) & 0xF), ds * x2, -ms * x2);
-                acc += __fmaf_rn((float)((qw >> 24) & 0xF), ds * x3, -ms * x3);
-            }
-            // High nibbles (next 16 elements)
-            #pragma unroll
-            for (int b = 0; b < 4; b++) {
-                uint32_t qw = (b == 0) ? q0 : (b == 1) ? q1 : (b == 2) ? q2 : q3;
-                uint32_t xi = xb + 16 + b * 4;
-                float x0 = x_shared[xi+0], x1 = x_shared[xi+1];
-                float x2 = x_shared[xi+2], x3 = x_shared[xi+3];
-                acc += __fmaf_rn((float)((qw >>  4) & 0xF), ds * x0, -ms * x0);
-                acc += __fmaf_rn((float)((qw >> 12) & 0xF), ds * x1, -ms * x1);
-                acc += __fmaf_rn((float)((qw >> 20) & 0xF), ds * x2, -ms * x2);
-                acc += __fmaf_rn((float)((qw >> 28) & 0xF), ds * x3, -ms * x3);
+            for (int b = 0; b < 8; b++) {
+                uint32_t qw = __ldg(qs32 + qs_off + b);
+                uint32_t xi_lo = xb + b * 4;
+                uint32_t xi_hi = xb + 32 + b * 4;
+                float xl0 = x_shared[xi_lo], xl1 = x_shared[xi_lo+1];
+                float xl2 = x_shared[xi_lo+2], xl3 = x_shared[xi_lo+3];
+                float xh0 = x_shared[xi_hi], xh1 = x_shared[xi_hi+1];
+                float xh2 = x_shared[xi_hi+2], xh3 = x_shared[xi_hi+3];
+                acc += __fmaf_rn((float)((qw >>  0) & 0xF), ds1 * xl0, -ms1 * xl0);
+                acc += __fmaf_rn((float)((qw >>  8) & 0xF), ds1 * xl1, -ms1 * xl1);
+                acc += __fmaf_rn((float)((qw >> 16) & 0xF), ds1 * xl2, -ms1 * xl2);
+                acc += __fmaf_rn((float)((qw >> 24) & 0xF), ds1 * xl3, -ms1 * xl3);
+                acc += __fmaf_rn((float)((qw >>  4) & 0xF), ds2 * xh0, -ms2 * xh0);
+                acc += __fmaf_rn((float)((qw >> 12) & 0xF), ds2 * xh1, -ms2 * xh1);
+                acc += __fmaf_rn((float)((qw >> 20) & 0xF), ds2 * xh2, -ms2 * xh2);
+                acc += __fmaf_rn((float)((qw >> 28) & 0xF), ds2 * xh3, -ms2 * xh3);
             }
         }
     }
